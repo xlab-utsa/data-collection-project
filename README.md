@@ -5,7 +5,7 @@ boards with cameras) capture high-quality video, compress it, packetize it
 and stream it over the network to a central **storage server**, which
 reassembles, decodes and records it.
 
-Project site: <https://utkrshkmr.github.io/data-collect-system/>
+Project site: <https://xlab-utsa.github.io/data-collection-project/>
 
 - [Goal](#goal)
 - [How the current code works](#how-the-current-code-works)
