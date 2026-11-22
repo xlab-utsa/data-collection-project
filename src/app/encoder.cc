@@ -31,7 +31,8 @@ Encoder::Encoder(const uint16_t display_width,
   check_call(vpx_codec_enc_config_default(&vpx_codec_vp9_cx_algo, &cfg_, 0),
              VPX_CODEC_OK, "vpx_codec_enc_config_default");
 
-  // copy the configuration below mostly from WebRTC (libvpx_vp9_encoder.cc)
+  // real-time, single-pass CBR configuration; mostly copied from WebRTC
+  // (libvpx_vp9_encoder.cc)
   cfg_.g_w = display_width_;
   cfg_.g_h = display_height_;
   cfg_.g_timebase.num = 1;
@@ -60,7 +61,7 @@ Encoder::Encoder(const uint16_t display_width,
   cfg_.rc_end_usage = VPX_CBR;
   cfg_.rc_target_bitrate = target_bitrate_;
 
-  // use no more than 16 or the number of avaialble CPUs
+  // speed/quality trade-off: higher is faster; capped at 16 or #CPUs
   const unsigned int cpu_used = min(get_nprocs(), 16);
 
   // more encoder settings
@@ -88,7 +89,7 @@ Encoder::Encoder(const uint16_t display_width,
   // disable frame parallel decoding
   codec_control(&context_, VP9E_SET_FRAME_PARALLEL_DECODING, 0);
 
-  // enable denoiser (but not on ARM since optimization is pending)
+  // enable the temporal denoiser (cheap on x86; WebRTC skips it on ARM)
   codec_control(&context_, VP9E_SET_NOISE_SENSITIVITY, 1);
 
   cerr << "Initialized VP9 encoder (CPU used: " << cpu_used << ")" << endl;
@@ -104,6 +105,9 @@ Encoder::~Encoder()
 void Encoder::compress_frame(const RawImage & raw_img)
 {
   const auto frame_generation_ts = timestamp_us();
+
+  // performance log line (if -o is given):
+  //   frame_id,target_bitrate_kbps,frame_size_bytes,encode_start_us,encode_end_us
 
   // encode raw_img into frame 'frame_id_'
   encode_frame(raw_img);
@@ -133,7 +137,9 @@ void Encoder::encode_frame(const RawImage & raw_img)
     throw runtime_error("Encoder: image dimensions don't match");
   }
 
-  // check if a key frame needs to be encoded
+  // Loss recovery: if the oldest unacked datagram has been outstanding for
+  // longer than MAX_UNACKED_US, stop retransmitting and force a key frame so
+  // the receiver can resynchronise without the lost data.
   vpx_enc_frame_flags_t encode_flags = 0; // normal frame
   if (not unacked_.empty()) {
     const auto & first_unacked = unacked_.cbegin()->second;
@@ -258,9 +264,10 @@ void Encoder::handle_ack(const shared_ptr<AckMsg> & ack)
 {
   const auto curr_ts = timestamp_us();
 
-  // Feedback from receiver can request RTT sample reset
-  if (ack->carry_info == 1) {
-    reset_rtt_sample_buffer_ = true;
+  // a bitrate report starts a new measurement period: start collecting a
+  // fresh window of RTT samples alongside it
+  if (ack->has_bitrate_feedback) {
+    reset_rtt_samples_ = true;
   }
 
   // observed an RTT sample
@@ -275,7 +282,10 @@ void Encoder::handle_ack(const shared_ptr<AckMsg> & ack)
     return;
   }
 
-  // retransmit all unacked datagrams before the acked one (backward)
+  // An ACK for (frame, frag) implies that every unacked datagram sent before
+  // it was probably lost (UDP keeps no order guarantee, but reordering is
+  // rare on the paths this targets). Queue them for retransmission, newest
+  // first so that emplace_front() leaves the oldest at the front.
   for (auto rit = make_reverse_iterator(acked_it);
        rit != unacked_.rend(); rit++) {
     auto & datagram = rit->second;
@@ -302,11 +312,11 @@ void Encoder::handle_ack(const shared_ptr<AckMsg> & ack)
 
 void Encoder::add_rtt_sample(const unsigned int rtt_us)
 {
-  if (reset_rtt_sample_array_) {
-    rtt_sample_array_.clear();
-    reset_rtt_sample_array_ = false;
+  if (reset_rtt_samples_) {
+    rtt_samples_.clear();
+    reset_rtt_samples_ = false;
   }
-  rtt_sample_array_.push_back(rtt_us);
+  rtt_samples_.push_back(rtt_us);
 
   // min RTT
   if (not min_rtt_us_ or rtt_us < *min_rtt_us_) {

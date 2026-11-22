@@ -50,8 +50,9 @@ public:
   void copy_u_from(const std::string_view src);
   void copy_v_from(const std::string_view src);
 
-  // Copy image data from the shared ring buffer
-  void copy_from_ringbuffer(const uint8_t* src, size_t size);
+  // copy a tightly packed I420 frame (Y plane, then U, then V; size must be
+  // W * H * 3 / 2), e.g. a slot of the sender's FrameRing
+  void copy_from_i420(const uint8_t * src, const size_t size);
 
   // forbid copy and move operators
   RawImage(const RawImage & other) = delete;

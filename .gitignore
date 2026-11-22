@@ -1,0 +1,36 @@
+# autotools output (regenerate with ./autogen.sh && ./configure)
+Makefile
+Makefile.in
+aclocal.m4
+autom4te.cache/
+config.h
+config.h.in
+config.h.in~
+config.log
+config.status
+configure
+configure~
+compile
+depcomp
+install-sh
+missing
+stamp-h1
+.deps/
+.dirstamp
+
+# compiler output
+*.o
+*.a
+
+# binaries
+src/app/video_sender
+src/app/video_receiver
+src/video/webcam
+tools/capture_to_disk
+
+# recordings written by the receiver / recorder
+src/app/data/
+*.y4m
+
+# editor settings
+.vscode/

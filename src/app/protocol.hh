@@ -1,17 +1,30 @@
 #ifndef PROTOCOL_HH
 #define PROTOCOL_HH
 
-#include <string>
+// Wire format between video_sender and video_receiver (all integers are
+// big-endian, see serialization.hh).
+//
+//   sender -> receiver   Datagram    one fragment of an encoded VP9 frame
+//   receiver -> sender   AckMsg      per-datagram ACK (+ optional bitrate feedback)
+//   both directions      ConfigMsg   handshake: receiver asks for a bitrate,
+//                                    sender answers with width/height/fps/bitrate
+//
+// Datagrams carry no message-type byte; the receiver tells them apart from a
+// ConfigMsg by size (a Datagram is always at least HEADER_SIZE bytes).
+
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <string_view>
 #include <utility>
 
 enum class FrameType : uint8_t {
-  UNKNOWN = 0, // unknown
-  KEY = 1,     // key frame
-  NONKEY = 2,  // non-key frame
+  UNKNOWN = 0,
+  KEY = 1,    // decodable on its own
+  NONKEY = 2, // depends on earlier frames
 };
 
-// uses (frame_id, frag_id) as sequence number
+// (frame_id, frag_id) uniquely identifies a datagram and orders them
 using SeqNum = std::pair<uint32_t, uint16_t>;
 
 struct Datagram
@@ -23,68 +36,75 @@ struct Datagram
            const uint16_t _frag_cnt,
            const std::string_view _payload);
 
-  uint32_t frame_id {};    // frame ID (1)
-  FrameType frame_type {}; // frame type (2)
-  uint16_t frag_id {};     // fragment ID in this frame (3)
-  uint16_t frag_cnt {};    // total fragments in this frame (4)
-  uint64_t send_ts {};     // timestamp (us) when the datagram is sent (5)
-  std::string payload {};  // payload (6)
+  // ---- fields on the wire, in order ----
+  uint32_t frame_id {};    // which video frame this fragment belongs to
+  FrameType frame_type {}; // key / non-key
+  uint16_t frag_id {};     // index of this fragment within the frame
+  uint16_t frag_cnt {};    // total number of fragments in the frame
+  uint64_t send_ts {};     // sender clock (us) at transmission; echoed in ACK
+  std::string payload {};  // slice of the encoded frame
 
-  // retransmission-related
-  unsigned int num_rtx {0};
-  uint64_t last_send_ts {0};
+  // ---- sender-side bookkeeping, not serialized ----
+  unsigned int num_rtx {0};   // how many times this datagram was retransmitted
+  uint64_t last_send_ts {0};  // when it was last (re)transmitted
 
-  // header size after serialization
   static constexpr size_t HEADER_SIZE = sizeof(uint32_t) +
       sizeof(FrameType) + 2 * sizeof(uint16_t) + sizeof(uint64_t);
 
-  // maximum size for 'payload' (initialized in .cc and modified by set_mtu())
+  // largest payload that keeps the IP packet within the MTU
   static size_t max_payload;
   static void set_mtu(const size_t mtu);
 
-  // construct this datagram by parsing binary string on wire
+  // returns false if 'binary' is too short to be a datagram
   bool parse_from_string(const std::string & binary);
-
-  // serialize this datagram to binary string on wire
   std::string serialize_to_string() const;
 };
 
+// Control messages start with a one-byte type tag.
 struct Msg
 {
   enum class Type : uint8_t {
-    INVALID = 0, // invalid message type
-    ACK = 1,     // AckMsg
-    CONFIG = 2   // ConfigMsg
+    INVALID = 0,
+    ACK = 1,
+    CONFIG = 2
   };
 
-  Type type {Type::INVALID}; // message type
+  Type type {Type::INVALID};
 
   Msg() {}
   Msg(const Type _type) : type(_type) {}
   virtual ~Msg() {}
 
-  // factory method to make a (derived class of) Msg
+  // returns nullptr for unknown, truncated or malformed messages
   static std::shared_ptr<Msg> parse_from_string(const std::string & binary);
 
-  // virtual functions
+private:
+  static std::shared_ptr<Msg> parse_body(const std::string & binary);
+
+public:
+
   virtual size_t serialized_size() const;
   virtual std::string serialize_to_string() const;
 };
 
 struct AckMsg : Msg
 {
-  // construct an AckMsg
   AckMsg() : Msg(Type::ACK) {}
-  // AckMsg(const Datagram & datagram);
-  AckMsg(const Datagram & datagram, uint8_t carry_info=0, uint32_t actual_bitrate=0);
 
-  uint32_t frame_id {}; // frame ID
-  uint16_t frag_id {};  // fragment ID in this frame
-  uint64_t send_ts {};  // timestamp (us) on sender when the datagram was sent
+  // ACK 'datagram'; optionally piggy-back the receiver's measured bitrate
+  AckMsg(const Datagram & datagram,
+         const bool has_bitrate_feedback = false,
+         const uint32_t measured_kbps_x100 = 0);
 
-  // transmit calculated bitrate back to sender
-  uint8_t carry_info {0};
-  uint32_t actual_bitrate {0};
+  uint32_t frame_id {}; // the acked datagram ...
+  uint16_t frag_id {};  // ... and fragment
+  uint64_t send_ts {};  // echoed from the datagram, for RTT measurement
+
+  // Receiver-measured throughput of decodable frames over the last ~1 s,
+  // in units of 0.01 kbps (i.e. kbps * 100). Only valid when
+  // has_bitrate_feedback is set, which happens about once per second.
+  uint8_t has_bitrate_feedback {0};
+  uint32_t measured_kbps_x100 {0};
 
   size_t serialized_size() const override;
   std::string serialize_to_string() const override;
@@ -92,15 +112,16 @@ struct AckMsg : Msg
 
 struct ConfigMsg : Msg
 {
-  // construct a ConfigMsg
   ConfigMsg() : Msg(Type::CONFIG) {}
   ConfigMsg(const uint16_t _width, const uint16_t _height,
             const uint16_t _frame_rate, const uint32_t _target_bitrate);
 
-  uint16_t width {};          // display width
-  uint16_t height {};         // display height
-  uint16_t frame_rate {};     // FPS
-  uint32_t target_bitrate {}; // target bitrate
+  // The receiver's request leaves width/height/frame_rate at 0 and only sets
+  // target_bitrate; the sender's reply fills in all four fields.
+  uint16_t width {};
+  uint16_t height {};
+  uint16_t frame_rate {};     // frames per second
+  uint32_t target_bitrate {}; // kbps
 
   size_t serialized_size() const override;
   std::string serialize_to_string() const override;

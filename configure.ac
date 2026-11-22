@@ -1,8 +1,12 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
+#
+# The build layout (util/ -> video/ -> app/) is inherited from Ringmaster
+# (https://github.com/microsoft/ringmaster), which this project extends with
+# live V4L2 capture and on-disk recording.
 
 AC_PREREQ([2.69])
-AC_INIT([ringmaster], [1.0], [francisy@microsoft.com])
+AC_INIT([data-collect-system], [2.1])
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 AC_CONFIG_HEADERS([config.h])
 
@@ -16,14 +20,9 @@ AC_PROG_CXX
 AC_PROG_RANLIB
 
 # Checks for libraries.
-PKG_CHECK_MODULES([VPX],[vpx])
-PKG_CHECK_MODULES([SDL],[sdl2])
-
-# Checks for header files.
-
-# Checks for typedefs, structures, and compiler characteristics.
-
-# Checks for library functions.
+PKG_CHECK_MODULES([VPX], [vpx])                      # VP9 encode/decode
+PKG_CHECK_MODULES([SDL], [sdl2])                     # preview / display windows
+PKG_CHECK_MODULES([AV], [libavutil libswscale])      # YUYV -> I420 / RGB565 conversion
 
 AC_CONFIG_FILES([
     Makefile

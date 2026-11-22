@@ -1,59 +1,30 @@
 #ifndef CAPTURE_HH
 #define CAPTURE_HH
 
-#include <stdint.h>
-#include <pthread.h>
+// Camera capture for the sender.
+//
+// run_capture() opens a V4L2 camera that produces packed YUYV 4:2:2 frames,
+// converts each frame to planar I420 (YUV 4:2:0, the encoder's input format)
+// and writes it into a FrameRing for the encoder thread. Optionally it also
+// shows a small 640x480 SDL preview window; pressing 'q' in that window
+// stops the whole program.
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include <string>
 
-void set_format();
-void init_mmap();
-void *preview_thread(void *arg);
-void capture_loop(const char *fname);
-void sigint_handler(int s);
-int low_space();
-void capture_disk_loop(const char *fname);
-void *capture_streaming_loop(void *arg);
+#include "frame_ring.hh"
 
-extern const char *dev_name;
-extern int fd;
-extern int width;
-extern int height;
-extern int fps;
-extern int pixel_mode;
-extern void *buffers;
-extern unsigned n_buffers;
-extern int run;
-
-#ifdef __cplusplus
-}
-#endif
-
-// ===== Shared ring buffer between capturing thread and streaming thread =====
-constexpr int FRAME_RING_SIZE = 500;
-
-struct YUV420PFrame {
-  uint8_t *data;
-  size_t size;
-  bool ready;
-  pthread_mutex_t lock;
+struct CaptureConfig
+{
+  std::string device {"/dev/video0"};
+  int width {1920};
+  int height {1080};
+  int fps {60};
+  bool preview {true}; // open the SDL preview window
 };
 
-extern YUV420PFrame frame_ring[FRAME_RING_SIZE];
-extern int frame_ring_head;
-extern int frame_ring_tail;
-extern pthread_cond_t frame_available;
-extern pthread_mutex_t frame_ring_mutex;
-extern size_t yuv_frame_size;
+// Capture until g_stop_requested (common.hh) becomes true. Intended to run on
+// its own thread. Errors are reported on stderr and also request a stop, so
+// the encoder thread does not wait forever for frames.
+void run_capture(const CaptureConfig & config, FrameRing & ring);
 
-// ===== Capture parameters structure =====
-struct CaptureParams {
-  int width;
-  int height;
-  int fps;
-};
-
-
-#endif // CAPTURE_HH
+#endif /* CAPTURE_HH */

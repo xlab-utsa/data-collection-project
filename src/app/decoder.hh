@@ -13,13 +13,14 @@ extern "C" {
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
+#include <string>
 #include <thread>
 
 #include "protocol.hh"
 #include "sdl.hh"
 #include "file_descriptor.hh"
 
-// decoder's view of a video frame
+// A video frame being reassembled on the receiver from its fragments.
 class Frame
 {
 public:
@@ -63,20 +64,33 @@ private:
   void validate_datagram(const Datagram & datagram) const;
 };
 
+// Receiver side: reassembles Datagrams into frames, measures goodput, and
+// hands complete frames to a worker thread that decodes them (VP9), records
+// them to a .y4m file and optionally displays them.
+//
+// Frames are consumed strictly in order. If the next frame cannot be
+// completed but a later key frame is complete, the decoder skips ahead to that
+// key frame (the sender forces one after giving up on retransmissions).
 class Decoder
 {
 public:
   enum LazyLevel : int {
-    DECODE_DISPLAY = 0,   // decode and display
-    DECODE_ONLY = 1,      // decode only but not display
-    NO_DECODE_DISPLAY = 2 // neither decode nor display
+    DECODE_DISPLAY = 0,   // decode, record to .y4m and display
+    DECODE_ONLY = 1,      // decode and record to .y4m, no window
+    NO_DECODE_DISPLAY = 2 // only reassemble frames (no decoding, no recording)
   };
 
+  // 'record_dir': where the decoded .y4m recording is written
+  // 'output_path': optional per-frame CSV log (empty = none)
   Decoder(const uint16_t display_width,
           const uint16_t display_height,
           const int lazy_level = 0,
           const uint16_t frame_rate = 30,
-          const std::string & output_path = "");
+          const std::string & output_path = "",
+          const std::string & record_dir = "./data");
+
+  // stops the worker after it has decoded and written every queued frame
+  ~Decoder();
 
   // add a received datagram
   void add_datagram(const Datagram & datagram);
@@ -85,17 +99,17 @@ public:
   // is next frame complete; might skip to a complete key frame ahead
   bool next_frame_complete();
 
-  // depending on the lazy level, might decode and display the next frame
+  // account for the next (complete) frame and pass it to the worker
   void consume_next_frame();
-
-  // output stats every second and reset
-  void output_periodic_stats();
 
   // accessors
   uint32_t next_frame() const { return next_frame_; }
 
-  std::optional<uint32_t> get_lastest_bitrate() const { return lastest_bitrate_; }
-  std::optional<uint32_t> get_pending_bitrate() 
+  // Goodput measured over the last ~1 s, in kbps * 100 (the AckMsg unit).
+  // take_pending_bitrate() returns each new measurement once, so it is sent
+  // to the sender in exactly one ACK.
+  std::optional<uint32_t> latest_bitrate() const { return latest_bitrate_; }
+  std::optional<uint32_t> take_pending_bitrate()
   {
     auto val = pending_bitrate_;
     pending_bitrate_.reset();
@@ -116,7 +130,8 @@ private:
   uint16_t display_width_;
   uint16_t display_height_;
   LazyLevel lazy_level_;
-  uint16_t frame_rate_; // Yuxin: frames per second
+  uint16_t frame_rate_;
+  std::string record_dir_;
   std::optional<FileDescriptor> output_fd_; // only one thread should output
   std::chrono::time_point<std::chrono::steady_clock> decoder_epoch_;
 
@@ -129,17 +144,18 @@ private:
   // frame ID => class Frame
   std::map<uint32_t, Frame> frame_buf_ {};
 
-  // performance stats
+  // goodput stats (main thread)
   unsigned int num_decodable_frames_ {0};
   size_t total_decodable_frame_size_ {0}; // bytes
   std::chrono::time_point<std::chrono::steady_clock> last_stats_time_ {};
-  std::optional<uint32_t> lastest_bitrate_ {}; // kbps
-  std::optional<uint32_t> pending_bitrate_ {}; // kbps
+  std::optional<uint32_t> latest_bitrate_ {};  // kbps * 100
+  std::optional<uint32_t> pending_bitrate_ {}; // kbps * 100, not yet sent
 
   // shared between main (Decoder) and worker threads
   std::mutex mtx_ {};
   std::condition_variable cv_ {};
   std::deque<Frame> shared_queue_ {};
+  bool stopping_ {false};
 
   // worker thread for decoding and displaying frames
   std::thread worker_ {};
@@ -153,10 +169,14 @@ private:
   // clean up states (such as frame_buf_) up to frame 'frontier'
   void clean_up_to(const uint32_t frontier);
 
+  // update and print the once-per-second goodput measurement
+  void update_bitrate_stats(const size_t frame_size);
+
   // worker thread calls the functions below
-  double decode_frame(vpx_codec_ctx_t & context, const Frame & frame);
-  void display_decoded_frame(vpx_codec_ctx_t & context, VideoDisplay & display);
-  void worker_main();
+  double decode_frame(vpx_codec_ctx_t & context, const Frame & frame,
+                      std::vector<uint8_t> & decode_buf);
+  void worker_main(); // thread entry point; reports errors
+  void worker_loop();
 };
 
 #endif /* DECODER_HH */

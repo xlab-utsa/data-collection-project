@@ -41,7 +41,8 @@ public:
   void deregister(const int fd);
   void deregister(const FileDescriptor & fd);
 
-  // execute the callbacks on the ready fds
+  // execute the callbacks on the ready fds; returns without running any
+  // callback if the wait is interrupted by a signal (EINTR)
   void poll(const int timeout_ms = -1);
 
 private:

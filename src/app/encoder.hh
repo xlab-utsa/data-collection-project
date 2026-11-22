@@ -17,6 +17,9 @@ extern "C" {
 #include "protocol.hh"
 #include "file_descriptor.hh"
 
+// VP9 encoder plus the sender half of the transport: it packetizes encoded
+// frames into MTU-sized Datagrams, keeps unacked datagrams, retransmits on
+// loss and forces a key frame when retransmission gives up.
 class Encoder
 {
 public:
@@ -40,7 +43,7 @@ public:
   // output stats every second and reset some of them
   void output_periodic_stats();
 
-  // set target bitrate
+  // set target bitrate (kbps); can be changed while streaming
   void set_target_bitrate(const unsigned int bitrate_kbps);
 
   // accessors
@@ -82,12 +85,16 @@ private:
   // unacked datagrams
   std::map<SeqNum, Datagram> unacked_ {};
 
-  // RTT-related
+  // RTT estimation from ACKs (send_ts is echoed back by the receiver)
   std::optional<unsigned int> min_rtt_us_ {};
   std::optional<double> ewma_rtt_us_ {};
-  static constexpr double ALPHA = 0.2;
-  std::vector<unsigned int> rtt_sample_array_ {}; // collected RTT samples
-  bool reset_rtt_sample_array_ {false};           // flag to clear RTT samples on feedback
+  static constexpr double ALPHA = 0.2; // EWMA weight of the newest sample
+
+  // RTT samples collected since the last bitrate report from the receiver.
+  // Not consumed yet: kept as input for the planned ACK-based adaptive
+  // bitrate controller (see README, "Roadmap").
+  std::vector<unsigned int> rtt_samples_ {};
+  bool reset_rtt_samples_ {false};
 
   // performance stats
   unsigned int num_encoded_frames_ {0};

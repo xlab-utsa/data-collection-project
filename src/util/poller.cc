@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cerrno>
 #include <iostream>
 
 #include "poller.hh"
@@ -84,7 +85,12 @@ void Poller::poll(const int timeout_ms)
     }
   }
 
-  check_syscall(::poll(fds_to_poll.data(), fds_to_poll.size(), timeout_ms));
+  if (::poll(fds_to_poll.data(), fds_to_poll.size(), timeout_ms) < 0) {
+    if (errno == EINTR) {
+      return; // interrupted by a signal: let the caller re-check its state
+    }
+    throw unix_error("poll");
+  }
 
   for (const auto & it : fds_to_poll) {
     for (const auto & [flag, callback] : roster_.at(it.fd)) {

@@ -1,383 +1,413 @@
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <iostream>
-#include <signal.h>
-#include <pthread.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/poll.h>
-#include <sys/statvfs.h>
-#include <time.h>
+#include <unistd.h>
 #include <linux/videodev2.h>
-#include <SDL2/SDL.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cstring>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 
 extern "C" {
-  #include "libavutil/imgutils.h"
-  #include "libavutil/pixfmt.h"
-  #include "libavutil/avutil.h"
-  #include "libswscale/swscale.h"
+#include <SDL2/SDL.h>
+#include <libavutil/pixfmt.h>
+#include <libswscale/swscale.h>
 }
 
 #include "capture.hh"
+#include "common.hh"
+#include "exception.hh"
 
 using namespace std;
+using namespace std::chrono;
 
-#define CLEAR(x) memset(&(x), 0, sizeof(x))
+namespace {
 
-const char *dev_name = "/dev/video0";
-int fd = -1;
-int width = 1920;
-int height = 1080;
-int fps = 60;
-// int pixel_mode = 422;
-void *buffers = NULL;
-unsigned n_buffers = 0;
-int run = 1;
+constexpr int PREVIEW_W = 640;
+constexpr int PREVIEW_H = 480;
+constexpr int PREVIEW_BYTES_PER_PIXEL = 2; // RGB565
+constexpr auto PREVIEW_INTERVAL = milliseconds(33); // refresh preview at ~30 Hz
+constexpr unsigned int NUM_V4L2_BUFFERS = 4;
 
-pthread_mutex_t preview_mtx = PTHREAD_MUTEX_INITIALIZER;
-uint8_t *preview_rgb = NULL;
-struct SwsContext *sws_ctx = NULL;
-uint8_t *ff_in_data = NULL;
-int ff_in_linesize = 0;
-uint8_t *ff_out_data = NULL;
-int ff_out_linesize[4];
-struct SwsContext *sws_preview_ctx = NULL;
-uint8_t *prev_in_data = NULL;
-int prev_in_linesize = 0;
-uint8_t *prev_out_data = NULL;
-int prev_out_linesize = 0;
-
-const int preview_w = 640;
-const int preview_h = 480;
-
-// Frame ring definition
-YUV420PFrame frame_ring[FRAME_RING_SIZE];
-int frame_ring_head = 0;
-int frame_ring_tail = 0;
-pthread_mutex_t frame_ring_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t frame_available = PTHREAD_COND_INITIALIZER;
-size_t yuv_frame_size = 0;
-
-void sigint_handler(int s) {
-  (void)s;
-  run = 0;
+// ioctl() that retries on EINTR, as recommended by the V4L2 docs
+int xioctl(const int fd, const unsigned long request, void * arg)
+{
+  int ret;
+  do {
+    ret = ioctl(fd, request, arg);
+  } while (ret == -1 and errno == EINTR);
+  return ret;
 }
 
-void set_format() {
-  struct v4l2_format fmt;
-  CLEAR(fmt);
-  fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  fmt.fmt.pix.width = width;
-  fmt.fmt.pix.height = height;
-  fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
-  fmt.fmt.pix.field = V4L2_FIELD_NONE;
-  if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-    perror("VIDIOC_S_FMT");
-    exit(1);
+// ---------------------------------------------------------------------------
+// V4L2 camera in memory-mapped streaming mode
+// ---------------------------------------------------------------------------
+class V4L2Camera
+{
+public:
+  V4L2Camera(const CaptureConfig & config)
+    : fd_(check_syscall(open(config.device.c_str(), O_RDWR | O_NONBLOCK),
+                        "open " + config.device))
+  {
+    try {
+      set_format(config);
+      map_buffers();
+      start_streaming();
+    } catch (...) {
+      release();
+      throw;
+    }
   }
 
-  struct v4l2_streamparm parm;
-  CLEAR(parm);
-  parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  parm.parm.capture.timeperframe.numerator = 1;
-  parm.parm.capture.timeperframe.denominator = fps;
-  if (ioctl(fd, VIDIOC_S_PARM, &parm) < 0) {
-    perror("VIDIOC_S_PARM");
-    exit(1);
-  }
-}
+  ~V4L2Camera() { release(); }
 
-void init_mmap() {
-  struct v4l2_requestbuffers req;
-  CLEAR(req);
-  req.count = 4;
-  req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  req.memory = V4L2_MEMORY_MMAP;
+  int fd() const { return fd_; }
+  size_t bytes_per_line() const { return bytes_per_line_; }
 
-  if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
-    perror("VIDIOC_REQBUFS");
-    exit(1);
-  }
-
-  n_buffers = req.count;
-  buffers = calloc(n_buffers, sizeof(void*));
-
-  for (unsigned i = 0; i < n_buffers; i++) {
-    struct v4l2_buffer buf;
-    CLEAR(buf);
+  // Dequeue a filled buffer; returns its index, or -1 if none is ready yet.
+  int dequeue()
+  {
+    v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = i;
 
-    ioctl(fd, VIDIOC_QUERYBUF, &buf);
-    buffers = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
-    if (buffers == MAP_FAILED) {
-      perror("mmap");
-      exit(1);
+    if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
+      if (errno == EAGAIN) {
+        return -1;
+      }
+      throw unix_error("VIDIOC_DQBUF");
     }
-    ioctl(fd, VIDIOC_QBUF, &buf);
+    return static_cast<int>(buf.index);
   }
-}
 
-int low_space() {
-  struct statvfs s;
-  if (statvfs(".", &s) < 0) return 0;
-  unsigned long long free_b = s.f_bavail * (unsigned long long)s.f_frsize;
-  return free_b < (1ULL << 30);
-}
+  const uint8_t * data(const int index) const
+  {
+    return static_cast<const uint8_t *>(buffers_.at(index).start);
+  }
 
-void *preview_thread(void *arg) {
-  (void)arg;
-  SDL_Init(SDL_INIT_VIDEO);
-  SDL_Window *win = SDL_CreateWindow("Preview", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, preview_w, preview_h, 0);
-  SDL_Renderer *ren = SDL_CreateRenderer(win, -1, 0);
-  SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, preview_w, preview_h);
+  // Hand a buffer back to the driver so it can be filled again.
+  void requeue(const int index)
+  {
+    v4l2_buffer buf;
+    memset(&buf, 0, sizeof(buf));
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    buf.index = static_cast<unsigned int>(index);
+    check_syscall(xioctl(fd_, VIDIOC_QBUF, &buf), "VIDIOC_QBUF");
+  }
 
-  SDL_Event ev;
-  while (run) {
-    while (SDL_PollEvent(&ev)) {
-      if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_q) run = 0;
+  V4L2Camera(const V4L2Camera &) = delete;
+  V4L2Camera & operator=(const V4L2Camera &) = delete;
+
+private:
+  struct MappedBuffer {
+    void * start;
+    size_t length;
+  };
+
+  int fd_;
+  size_t bytes_per_line_ {0};
+  vector<MappedBuffer> buffers_ {};
+  bool streaming_ {false};
+
+  void set_format(const CaptureConfig & config)
+  {
+    v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = config.width;
+    fmt.fmt.pix.height = config.height;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE; // progressive
+    check_syscall(xioctl(fd_, VIDIOC_S_FMT, &fmt), "VIDIOC_S_FMT");
+
+    // the driver may silently pick a different mode; refuse to continue,
+    // since the encoder and the receiver were told the requested size
+    if (fmt.fmt.pix.width != static_cast<unsigned>(config.width) or
+        fmt.fmt.pix.height != static_cast<unsigned>(config.height) or
+        fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
+      throw runtime_error("camera does not support YUYV " +
+                          to_string(config.width) + "x" +
+                          to_string(config.height) + " (driver offered " +
+                          to_string(fmt.fmt.pix.width) + "x" +
+                          to_string(fmt.fmt.pix.height) + ")");
+    }
+    bytes_per_line_ = fmt.fmt.pix.bytesperline
+                      ? fmt.fmt.pix.bytesperline : config.width * 2;
+
+    v4l2_streamparm parm;
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = config.fps;
+    check_syscall(xioctl(fd_, VIDIOC_S_PARM, &parm), "VIDIOC_S_PARM");
+  }
+
+  void map_buffers()
+  {
+    v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = NUM_V4L2_BUFFERS;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    check_syscall(xioctl(fd_, VIDIOC_REQBUFS, &req), "VIDIOC_REQBUFS");
+
+    // map every buffer separately and remember where each one lives;
+    // DQBUF reports buffers by index, so frames are found via buffers_[index]
+    for (unsigned int i = 0; i < req.count; i++) {
+      v4l2_buffer buf;
+      memset(&buf, 0, sizeof(buf));
+      buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      buf.memory = V4L2_MEMORY_MMAP;
+      buf.index = i;
+      check_syscall(xioctl(fd_, VIDIOC_QUERYBUF, &buf), "VIDIOC_QUERYBUF");
+
+      void * start = mmap(nullptr, buf.length, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, fd_, buf.m.offset);
+      if (start == MAP_FAILED) {
+        throw unix_error("mmap");
+      }
+      buffers_.push_back({start, buf.length});
+
+      check_syscall(xioctl(fd_, VIDIOC_QBUF, &buf), "VIDIOC_QBUF");
+    }
+  }
+
+  void start_streaming()
+  {
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    check_syscall(xioctl(fd_, VIDIOC_STREAMON, &type), "VIDIOC_STREAMON");
+    streaming_ = true;
+  }
+
+  void release()
+  {
+    if (streaming_) {
+      int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+      xioctl(fd_, VIDIOC_STREAMOFF, &type);
+      streaming_ = false;
+    }
+    for (const auto & b : buffers_) {
+      munmap(b.start, b.length);
+    }
+    buffers_.clear();
+    if (fd_ >= 0) {
+      close(fd_);
+      fd_ = -1;
+    }
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Preview window: shows the most recent RGB565 frame on its own thread
+// ---------------------------------------------------------------------------
+class PreviewWindow
+{
+public:
+  PreviewWindow() : thread_(&PreviewWindow::run, this) {}
+
+  ~PreviewWindow()
+  {
+    {
+      lock_guard<mutex> lock(mtx_);
+      closing_ = true;
+    }
+    thread_.join();
+  }
+
+  // copy the latest preview frame (PREVIEW_W x PREVIEW_H, RGB565)
+  void update(const uint8_t * rgb565)
+  {
+    lock_guard<mutex> lock(mtx_);
+    memcpy(pixels_.data(), rgb565, pixels_.size());
+    has_frame_ = true;
+  }
+
+  PreviewWindow(const PreviewWindow &) = delete;
+  PreviewWindow & operator=(const PreviewWindow &) = delete;
+
+private:
+  mutex mtx_ {};
+  vector<uint8_t> pixels_ =
+      vector<uint8_t>(PREVIEW_W * PREVIEW_H * PREVIEW_BYTES_PER_PIXEL);
+  bool has_frame_ {false};
+  bool closing_ {false};
+  thread thread_;
+
+  bool closing()
+  {
+    lock_guard<mutex> lock(mtx_);
+    return closing_ or g_stop_requested;
+  }
+
+  void run()
+  {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+      cerr << "Preview disabled: SDL_Init failed: " << SDL_GetError() << endl;
+      return;
     }
 
-    pthread_mutex_lock(&preview_mtx);
-    if (preview_rgb) {
-      SDL_UpdateTexture(tex, NULL, preview_rgb, preview_w * 2);
-      pthread_mutex_unlock(&preview_mtx);
+    SDL_Window * win = SDL_CreateWindow("Sender preview",
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+        PREVIEW_W, PREVIEW_H, 0);
+    SDL_Renderer * ren = win ? SDL_CreateRenderer(win, -1, 0) : nullptr;
+    SDL_Texture * tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB565,
+        SDL_TEXTUREACCESS_STREAMING, PREVIEW_W, PREVIEW_H) : nullptr;
 
-      SDL_RenderClear(ren);
-      SDL_RenderCopy(ren, tex, NULL, NULL);
-      SDL_RenderPresent(ren);
+    if (not tex) {
+      cerr << "Preview disabled: " << SDL_GetError() << endl;
     } else {
-      pthread_mutex_unlock(&preview_mtx);
-      SDL_Delay(33);
-    }
-  }
+      SDL_Event ev;
+      while (not closing()) {
+        while (SDL_PollEvent(&ev)) {
+          if ((ev.type == SDL_KEYDOWN and ev.key.keysym.sym == SDLK_q) or
+              ev.type == SDL_QUIT) {
+            cerr << "Preview window closed: stopping." << endl;
+            g_stop_requested = true;
+          }
+        }
 
-  SDL_DestroyTexture(tex);
-  SDL_DestroyRenderer(ren);
-  SDL_DestroyWindow(win);
-  SDL_Quit();
-  return NULL;
+        bool drew = false;
+        {
+          lock_guard<mutex> lock(mtx_);
+          if (has_frame_) {
+            SDL_UpdateTexture(tex, nullptr, pixels_.data(),
+                              PREVIEW_W * PREVIEW_BYTES_PER_PIXEL);
+            has_frame_ = false;
+            drew = true;
+          }
+        }
+
+        if (drew) {
+          SDL_RenderClear(ren);
+          SDL_RenderCopy(ren, tex, nullptr, nullptr);
+          SDL_RenderPresent(ren);
+        } else {
+          SDL_Delay(10);
+        }
+      }
+    }
+
+    if (tex) SDL_DestroyTexture(tex);
+    if (ren) SDL_DestroyRenderer(ren);
+    if (win) SDL_DestroyWindow(win);
+    SDL_Quit();
+  }
+};
+
+struct SwsDeleter {
+  void operator()(SwsContext * ctx) const { sws_freeContext(ctx); }
+};
+using SwsPtr = unique_ptr<SwsContext, SwsDeleter>;
+
+SwsPtr make_sws(const int src_w, const int src_h, const AVPixelFormat src_fmt,
+                const int dst_w, const int dst_h, const AVPixelFormat dst_fmt)
+{
+  SwsContext * ctx = sws_getContext(src_w, src_h, src_fmt, dst_w, dst_h,
+                                    dst_fmt, SWS_BILINEAR,
+                                    nullptr, nullptr, nullptr);
+  if (not ctx) {
+    throw runtime_error("sws_getContext failed");
+  }
+  return SwsPtr(ctx);
 }
 
-// ------------------ Disk Recording Capture Loop ------------------
-void capture_disk_loop(const char *fname) {
-  pthread_t tid;
-  pthread_create(&tid, NULL, preview_thread, NULL);
-  FILE *out = fopen(fname, "wb");
-  if (!out) { perror("fopen"); exit(1); }
-  fprintf(out, "YUV4MPEG2 W%d H%d F%d:1 Ip A0:0\n", width, height, fps);
+void capture_loop(const CaptureConfig & config, FrameRing & ring)
+{
+  const int w = config.width;
+  const int h = config.height;
 
-  ff_in_linesize = width * 2;
-  ff_in_data = (uint8_t *) av_malloc(ff_in_linesize * height);
-  ff_out_linesize[0] = width;
-  ff_out_linesize[1] = width / 2;
-  ff_out_linesize[2] = width / 2;
-  size_t ysz = width * height;
-  size_t usz = ysz / 4;
-  ff_out_data = (uint8_t *) av_malloc(ysz + 2 * usz);
+  V4L2Camera camera(config);
+  cerr << "Capturing from " << config.device << ": " << w << "x" << h
+       << " YUYV @ " << config.fps << " fps" << endl;
 
-  sws_ctx = sws_getContext(width, height, AV_PIX_FMT_YUYV422, width, height, AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+  // YUYV 4:2:2 (packed) -> I420 (planar Y, U, V; chroma at half resolution)
+  const SwsPtr to_i420 = make_sws(w, h, AV_PIX_FMT_YUYV422,
+                                  w, h, AV_PIX_FMT_YUV420P);
+  const size_t y_size = static_cast<size_t>(w) * h;
+  const size_t uv_size = y_size / 4;
+  int i420_strides[3] = {w, w / 2, w / 2};
 
-  struct pollfd pfd = { fd, POLLIN, 0 };
-  int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  ioctl(fd, VIDIOC_STREAMON, &type);
-  
-  time_t last_flush = time(NULL);
-
-  while (run) {
-    if (low_space()) break;
-    if (poll(&pfd, 1, 1000) < 0) continue;
-
-    struct v4l2_buffer buf;
-    CLEAR(buf);
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    ioctl(fd, VIDIOC_DQBUF, &buf);
-    uint8_t *data = (uint8_t *)buffers + buf.m.offset;
-
-    memcpy(ff_in_data, data, ff_in_linesize * height);
-    const uint8_t *in[1] = { ff_in_data };
-    int in_ls[1] = { ff_in_linesize };
-    uint8_t *out_planes[3] = {
-      ff_out_data,
-      ff_out_data + ysz,
-      ff_out_data + ysz + usz
-    };
-    sws_scale(sws_ctx, in, in_ls, 0, height, out_planes, ff_out_linesize);
-
-    fprintf(out, "FRAME\n");
-    fwrite(out_planes[0], 1, ysz, out);
-    fwrite(out_planes[1], 1, usz, out);
-    fwrite(out_planes[2], 1, usz, out);
-
-    ioctl(fd, VIDIOC_QBUF, &buf);
-    if (difftime(time(NULL), last_flush) >= 5.0) { fflush(out); last_flush = time(NULL); }
+  // YUYV -> downscaled RGB565 for the preview window
+  unique_ptr<PreviewWindow> preview;
+  SwsPtr to_preview;
+  vector<uint8_t> preview_rgb;
+  if (config.preview) {
+    preview = make_unique<PreviewWindow>();
+    to_preview = make_sws(w, h, AV_PIX_FMT_YUYV422,
+                          PREVIEW_W, PREVIEW_H, AV_PIX_FMT_RGB565);
+    preview_rgb.resize(PREVIEW_W * PREVIEW_H * PREVIEW_BYTES_PER_PIXEL);
   }
+  auto last_preview = steady_clock::now() - PREVIEW_INTERVAL;
 
-  int type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  ioctl(fd, VIDIOC_STREAMOFF, &type_off);
+  const int src_stride[1] = {static_cast<int>(camera.bytes_per_line())};
+  size_t last_reported_drops = 0;
 
-  fclose(out);
-  pthread_join(tid, NULL);
-  sws_freeContext(sws_ctx);
-  av_free(ff_in_data);
-  av_free(ff_out_data);
+  while (not g_stop_requested) {
+    pollfd pfd {camera.fd(), POLLIN, 0};
+    const int ret = ::poll(&pfd, 1, 1000);
+    if (ret < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw unix_error("poll");
+    }
+    if (ret == 0) {
+      cerr << "Warning: no frame from camera for 1 s" << endl;
+      continue;
+    }
+
+    const int index = camera.dequeue();
+    if (index < 0) {
+      continue;
+    }
+    const uint8_t * src_planes[1] = {camera.data(index)};
+
+    // preview (rate-limited; the scaling is not free at 4K and above)
+    const auto now = steady_clock::now();
+    if (preview and now - last_preview >= PREVIEW_INTERVAL) {
+      uint8_t * dst[1] = {preview_rgb.data()};
+      const int dst_stride[1] = {PREVIEW_W * PREVIEW_BYTES_PER_PIXEL};
+      sws_scale(to_preview.get(), src_planes, src_stride, 0, h,
+                dst, dst_stride);
+      preview->update(preview_rgb.data());
+      last_preview = now;
+    }
+
+    // convert straight into a free ring slot (or drop the frame if the
+    // encoder is so far behind that the ring is full)
+    if (uint8_t * slot = ring.begin_write()) {
+      uint8_t * dst[3] = {slot, slot + y_size, slot + y_size + uv_size};
+      sws_scale(to_i420.get(), src_planes, src_stride, 0, h,
+                dst, i420_strides);
+      ring.commit_write();
+    } else if (ring.dropped() >= last_reported_drops + 100) {
+      last_reported_drops = ring.dropped();
+      cerr << "Warning: frame ring full; dropped " << last_reported_drops
+           << " captured frames so far" << endl;
+    }
+
+    camera.requeue(index);
+  }
 }
 
-// ------------------ Streaming-Oriented Capture Loop ------------------
-void *capture_streaming_loop(void *arg) {
+} // namespace
 
-  auto *params = static_cast<CaptureParams *>(arg);
-  width = params->width;
-  height = params->height;
-  fps = params->fps;
-
-  fd = open(dev_name, O_RDWR | O_NONBLOCK, 0);
-
-  // Set V4L2 format & parameters, initialize memory mapping, and start capture
-  set_format();
-  cerr << "Set format: " << dev_name 
-       << " width=" << width 
-       << " height=" << height 
-       << " FPS=" << fps << endl;
-  init_mmap();
-
-  // Initialize buffers for preview
-  prev_in_linesize = width * 2;
-  prev_out_linesize = preview_w * 2;
-  prev_in_data = (uint8_t *) av_malloc(prev_in_linesize * height);
-  prev_out_data = (uint8_t *) av_malloc(prev_out_linesize * preview_h);
-  preview_rgb = (uint8_t *) malloc(preview_w * preview_h * 2);
-
-  sws_preview_ctx = sws_getContext(
-    width, height, AV_PIX_FMT_YUYV422, 
-    preview_w, preview_h, AV_PIX_FMT_RGB565, 
-    SWS_BILINEAR, NULL, NULL, NULL);
-
-  // Initilize buffers for YUV420P conversion
-  ff_in_linesize     = width * 2;
-  ff_in_data         = (uint8_t *)av_malloc(ff_in_linesize * height);
-  ff_out_linesize[0] = width;       // Y plane pitch = width
-  ff_out_linesize[1] = width / 2;   // U plane pitch
-  ff_out_linesize[2] = width / 2;   // V plane pitch
-  // ff_out_data        = (uint8_t *)av_malloc(av_image_get_buffer_size(AV_PIX_FMT_YUV420P, width, height, 1));
-  yuv_frame_size = width * height * 3 / 2;
-  ff_out_data        = (uint8_t *)av_malloc(yuv_frame_size);
-
-  // Initialize swscale context for YUYV422 → YUV420P
-  sws_ctx = sws_getContext(
-    width, height, AV_PIX_FMT_YUYV422, 
-    width, height, AV_PIX_FMT_YUV420P, 
-    SWS_BILINEAR, NULL, NULL, NULL);
-  
-  // cerr<< "Initialized Preview and YUV420P conversion." << endl;
-
-  pthread_t tid;
-  pthread_create(&tid, NULL, preview_thread, NULL);
-
-  // cerr << "Launched preview thread." << endl;
-
-  // Start streaming on the V4L2 device
-  struct pollfd pfd = { fd, POLLIN, 0 };
-  int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  ioctl(fd, VIDIOC_STREAMON, &type);
-
-  cerr << "Started streaming on device: " << dev_name << endl;
-
-  while (run) {
-    if (low_space()){
-      fprintf(stderr, "Disk <1GiB, stopping.\n");
-      break;
-    }
-
-    if (poll(&pfd, 1, 1000) < 0){
-      if (errno == EINTR)
-          continue;
-      perror("poll");
-      break;
-    }
-
-    // Dequeue the next buffer containing a captured frame
-    struct v4l2_buffer buf;
-    CLEAR(buf);
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    ioctl(fd, VIDIOC_DQBUF, &buf);
-
-    // cerr << "Dequeued buffer index: " << buf.index << endl;
-
-    // Pointer to raw YUYV data from mapped buffers
-    uint8_t *data = (uint8_t *)buffers + buf.m.offset;
-
-    // cerr << "Buffer size: " << buf.bytesused << ", offset: " << buf.m.offset << endl;
-
-    // --- Preview conversion: YUYV422 → RGB565 (scaled to 640×480) ---
-    memcpy(prev_in_data, data, prev_in_linesize * height);
-    const uint8_t *in[1] = { prev_in_data };
-    int in_ls[1] = { prev_in_linesize };
-    uint8_t *out[1] = { prev_out_data };
-    int out_ls[1] = { prev_out_linesize };
-
-    sws_scale(sws_preview_ctx, in, in_ls, 0, height, out, out_ls);
-    pthread_mutex_lock(&preview_mtx);
-    memcpy(preview_rgb, prev_out_data, prev_out_linesize * preview_h);
-    pthread_mutex_unlock(&preview_mtx);
-
-    // cerr << "Captured frame: " << buf.index << ", size: " << buf.bytesused << endl;
-
-    // YUV420P conversion
-    memcpy(ff_in_data, data, ff_in_linesize * height);
-    const uint8_t *src_planes[1] = { ff_in_data };
-    int src_stride[1] = { ff_in_linesize };
-
-    size_t y_sz = ff_out_linesize[0] * height;
-    size_t u_sz = ff_out_linesize[1] * (height / 2);
-    uint8_t *out_planes[3] = {
-      ff_out_data,
-      ff_out_data + y_sz,
-      ff_out_data + y_sz + u_sz
-    };
-
-    sws_scale(
-        sws_ctx,
-        src_planes, src_stride,
-        0, height,
-        out_planes, ff_out_linesize
-    );
-
-    pthread_mutex_lock(&frame_ring_mutex);
-    if (!frame_ring[frame_ring_head].ready) {
-      pthread_mutex_lock(&frame_ring[frame_ring_head].lock);
-      memcpy(frame_ring[frame_ring_head].data, ff_out_data, yuv_frame_size);
-      frame_ring[frame_ring_head].size = yuv_frame_size;
-      frame_ring[frame_ring_head].ready = true;
-
-      pthread_mutex_unlock(&frame_ring[frame_ring_head].lock);
-      frame_ring_head = (frame_ring_head + 1) % FRAME_RING_SIZE;
-      pthread_cond_signal(&frame_available);
-
-      // cerr << "Stored frame in ring buffer at index: " << frame_ring_head << endl;
-    }
-    pthread_mutex_unlock(&frame_ring_mutex);
-
-    ioctl(fd, VIDIOC_QBUF, &buf);
+void run_capture(const CaptureConfig & config, FrameRing & ring)
+{
+  try {
+    capture_loop(config, ring);
+  } catch (const exception & e) {
+    cerr << "Capture thread error: " << e.what() << endl;
+    g_stop_requested = true;
   }
-
-  int type_off = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  ioctl(fd, VIDIOC_STREAMOFF, &type_off);
-
-  pthread_join(tid, NULL);
-  sws_freeContext(sws_preview_ctx);
-  av_free(prev_in_data);
-  av_free(prev_out_data);
-  free(preview_rgb);
-  close(fd);
-
-  return nullptr;
 }

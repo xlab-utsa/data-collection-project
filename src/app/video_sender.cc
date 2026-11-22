@@ -1,64 +1,60 @@
+// video_sender: runs on the camera machine (e.g. a Jetson board).
+//
+//   capture thread:  V4L2 camera --YUYV--> swscale --I420--> FrameRing
+//   main thread:     FrameRing --> VP9 encoder --> Datagrams --UDP--> receiver
+//                    <-- ACKs (RTT, retransmission, bitrate feedback) <--
+//
+// Start it first; it waits for a receiver to connect and ask for a bitrate.
+
 #include <getopt.h>
+
+#include <cstdlib>
 #include <iostream>
-#include <string>
 #include <memory>
-#include <stdexcept>
-#include <utility>
-#include <chrono>
-#include <csignal>
-#include <atomic>
+#include <string>
+#include <thread>
 
-#include "conversion.hh"
-#include "timerfd.hh"
-#include "udp_socket.hh"
-#include "poller.hh"
-#include "yuv4mpeg.hh"
-#include "protocol.hh"
-#include "encoder.hh"
-#include "timestamp.hh"
 #include "capture.hh"
-
-std::atomic<bool> keep_running{true};
+#include "common.hh"
+#include "conversion.hh"
+#include "encoder.hh"
+#include "frame_ring.hh"
+#include "poller.hh"
+#include "protocol.hh"
+#include "timerfd.hh"
+#include "timestamp.hh"
+#include "udp_socket.hh"
 
 using namespace std;
-using namespace chrono;
 
-// global variables in an unnamed namespace
 namespace {
-  constexpr unsigned int BILLION = 1000 * 1000 * 1000;
-}
+
+constexpr long BILLION = 1000L * 1000 * 1000;
 
 void print_usage(const string & program_name)
 {
   cerr <<
-  "Usage: " << program_name << " [options] port y4m\n\n"
-  "Options:\n"
-  "--mtu <MTU>                MTU for deciding UDP payload size\n"
-  "-o, --output <file>        file to output performance results to\n"
-  "-v, --verbose              enable more logging for debugging"
+  "Usage: " << program_name << " <port> -w <width> -h <height> -r <fps> [options]\n\n"
+  "  -w, --width <W>        capture width\n"
+  "  -h, --height <H>       capture height\n"
+  "  -r, --fps <FPS>        capture and encoding frame rate\n"
+  "  -d, --device <path>    V4L2 camera (default: /dev/video0)\n"
+  "  --mtu <bytes>          MTU used to size datagrams (default: 1500)\n"
+  "  --no-preview           do not open the 640x480 preview window\n"
+  "  -o, --output <file>    write per-frame encoder stats (CSV) to <file>\n"
+  "  -v, --verbose          log every datagram and ACK\n\n"
+  "Supported modes (camera/V4L2 limits):\n"
+  "  up to 1280x720 @ 120, 1920x1080 @ 60, 2000x1500 @ 50,\n"
+  "        3840x2160 @ 20, 4000x3000 @ 14, 8000x6000 @ 3\n"
+  "  frame rate must be one of 120, 60, 50, 20, 14, 3\n"
   << endl;
 }
 
-pair<Address, ConfigMsg> recv_config_msg(UDPSocket & udp_sock)
+// The camera this was built for only exposes a few modes; reject anything
+// else up front instead of letting the driver silently pick another mode.
+bool validate_resolution_and_fps(const int width, const int height,
+                                 const int fps)
 {
-  // wait until a valid ConfigMsg is received
-  while (true) {
-    const auto & [peer_addr, raw_data] = udp_sock.recvfrom();
-
-    const shared_ptr<Msg> msg = Msg::parse_from_string(raw_data.value());
-    if (msg == nullptr or msg->type != Msg::Type::CONFIG) {
-      continue; // ignore invalid or non-config messages
-    }
-
-    const auto config_msg = dynamic_pointer_cast<ConfigMsg>(msg);
-    if (config_msg) {
-      return {peer_addr, *config_msg};
-    }
-  }
-}
-
-bool validate_resolution_and_fps(int width, int height, int fps) {
-
   struct Tier { int w, h, max_fps; };
   static const Tier tiers[] = {
     { 1280,  720, 120 },
@@ -70,183 +66,180 @@ bool validate_resolution_and_fps(int width, int height, int fps) {
   };
   static const int allowed_fps[] = { 120, 60, 50, 20, 14, 3 };
 
+  // smallest tier that contains the requested resolution
   int tier_max = 0;
-  for (const auto& tier : tiers) {
-    if (width <= tier.w && height <= tier.h) {
+  for (const auto & tier : tiers) {
+    if (width <= tier.w and height <= tier.h) {
       tier_max = tier.max_fps;
       break;
     }
   }
 
-  if (!tier_max) {
+  if (tier_max == 0) {
     cerr << "Unsupported resolution: " << width << "x" << height << endl;
     return false;
   }
 
-  for (int allowed : allowed_fps) {
-    if (fps == allowed && fps <= tier_max) {
+  for (const int allowed : allowed_fps) {
+    if (fps == allowed and fps <= tier_max) {
       return true;
     }
   }
 
-  cerr << "Unsupported frame rate " << fps << "fps for resolution "
-       << width << "x" << height << " (max " << tier_max << "fps)\n";
+  cerr << "Unsupported frame rate " << fps << " fps for resolution "
+       << width << "x" << height << " (max " << tier_max << " fps)" << endl;
   return false;
 }
 
-void handle_sigint(int)
-{
-  keep_running = false;
-}
+} // namespace
 
-
-// ************************** Main: get frames from buffer ***********************************
 int main(int argc, char * argv[])
 {
+  CaptureConfig cap;
+  cap.width = cap.height = cap.fps = 0;
   string output_path;
   bool verbose = false;
 
-  // ===== Argument parsing =====
-  if (argc < 6) {
-    cerr << "Usage: " << argv[0] << " <port> -w <width> -h <height> -r <fps>\n";
-    return EXIT_FAILURE;
-  }
-
-  int port_int = atoi(argv[1]);
-  if (port_int <= 0) {
-    cerr << "Invalid port number: " << argv[1] << endl;
-    return EXIT_FAILURE;
-  }
-  uint16_t port = static_cast<uint16_t>(port_int);
-
-  int opt;
-  optind = 2;
+  // ===== argument parsing =====
+  // note: -h is height (kept for compatibility); use --help for help
   const option cmd_line_opts[] = {
-    {"width",  required_argument, nullptr, 'w'},
-    {"height", required_argument, nullptr, 'h'},
-    {"fps",    required_argument, nullptr, 'r'},
-    {nullptr,  0,                 nullptr,  0 }
+    {"width",      required_argument, nullptr, 'w'},
+    {"height",     required_argument, nullptr, 'h'},
+    {"fps",        required_argument, nullptr, 'r'},
+    {"device",     required_argument, nullptr, 'd'},
+    {"mtu",        required_argument, nullptr, 'M'},
+    {"no-preview", no_argument,       nullptr, 'P'},
+    {"output",     required_argument, nullptr, 'o'},
+    {"verbose",    no_argument,       nullptr, 'v'},
+    {"help",       no_argument,       nullptr, 'H'},
+    {nullptr,      0,                 nullptr,  0 },
   };
 
-  while ((opt = getopt_long(argc, argv, "w:h:r:", cmd_line_opts, nullptr)) != -1) {
-    switch (opt) {
-      case 'w':
-        width = atoi(optarg);
+  try {
+    while (true) {
+      const int opt = getopt_long(argc, argv, "w:h:r:d:o:v",
+                                  cmd_line_opts, nullptr);
+      if (opt == -1) {
         break;
-      case 'h':
-        height = atoi(optarg);
-        break;
-      case 'r':
-        fps = atoi(optarg);
-        break;
-      default:
-        cerr << "Usage: " << argv[0] << " <port> -w <width> -h <height> -r <fps>\n";
-        return EXIT_FAILURE;
+      }
+
+      switch (opt) {
+        case 'w': cap.width = strict_stoi(optarg); break;
+        case 'h': cap.height = strict_stoi(optarg); break;
+        case 'r': cap.fps = strict_stoi(optarg); break;
+        case 'd': cap.device = optarg; break;
+        case 'M': Datagram::set_mtu(strict_stoi(optarg)); break;
+        case 'P': cap.preview = false; break;
+        case 'o': output_path = optarg; break;
+        case 'v': verbose = true; break;
+        case 'H': print_usage(argv[0]); return EXIT_SUCCESS;
+        default:  print_usage(argv[0]); return EXIT_FAILURE;
+      }
     }
-  }
-
-  if (width <= 0 || height <= 0 || fps <= 0) {
-    cerr << "Invalid input: width, height, and fps must all be > 0\n";
+  } catch (const exception & e) {
+    cerr << "Invalid argument: " << e.what() << endl;
     return EXIT_FAILURE;
   }
 
-  cerr << "Input: Port: " << port << ", Width: " << width
-       << ", Height: " << height << ", FPS: " << fps << endl;
+  // getopt_long permutes argv, so the port can come before or after options
+  if (optind != argc - 1) {
+    print_usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+  const auto port = narrow_cast<uint16_t>(strict_stoi(argv[optind]));
 
-  if (!validate_resolution_and_fps(width, height, fps)) {
+  if (cap.width <= 0 or cap.height <= 0 or cap.fps <= 0) {
+    cerr << "-w, -h and -r are required and must be > 0" << endl;
+    return EXIT_FAILURE;
+  }
+  if (cap.width % 2 or cap.height % 2) {
+    cerr << "width and height must be even (I420 chroma subsampling)" << endl;
+    return EXIT_FAILURE;
+  }
+  if (not validate_resolution_and_fps(cap.width, cap.height, cap.fps)) {
     return EXIT_FAILURE;
   }
 
-  // ===== Initialize shared ring buffer =====
-  yuv_frame_size = width * height * 3 / 2;
-  for (int i = 0; i < FRAME_RING_SIZE; ++i) {
-    frame_ring[i].data = (uint8_t *)malloc(yuv_frame_size);
-    frame_ring[i].size = 0;
-    frame_ring[i].ready = false;
-    pthread_mutex_init(&frame_ring[i].lock, nullptr);
-  }
-  // cerr << "Initialized shared frame ring buffer with size: " << FRAME_RING_SIZE << endl;
+  const auto width = narrow_cast<uint16_t>(cap.width);
+  const auto height = narrow_cast<uint16_t>(cap.height);
+  const auto fps = narrow_cast<uint16_t>(cap.fps);
+  cerr << "Sender: port " << port << ", " << width << "x" << height
+       << " @ " << fps << " fps" << endl;
 
+  install_stop_signal_handlers();
+
+  // ===== handshake: wait for a receiver to ask for a bitrate =====
   UDPSocket udp_sock;
   udp_sock.bind({"0", port});
-  cerr << "Local address: " << udp_sock.local_address().str() << endl;
+  cerr << "Local address: " << udp_sock.local_address().str()
+       << "; waiting for receiver..." << endl;
 
-  // cerr << "Waiting for receiver..." << endl;
+  const auto request = wait_for_config_msg(udp_sock);
+  if (not request) {
+    return EXIT_SUCCESS; // interrupted while waiting
+  }
+  const auto & [peer_addr, request_msg] = *request;
+  const uint32_t target_bitrate = request_msg.target_bitrate;
+  cerr << "Receiver " << peer_addr.str() << " requested "
+       << target_bitrate << " kbps" << endl;
 
-  const auto & [peer_addr, config_msg] = recv_config_msg(udp_sock);
-  cerr << "From receiver: Peer address: " << peer_addr.str() << endl;
   udp_sock.connect(peer_addr);
 
-  const auto target_bitrate = config_msg.target_bitrate;
-
-  cerr << "Received bitrate=" << to_string(target_bitrate) << endl;
-
-  const ConfigMsg config_msg_full(width, height, fps, target_bitrate);
-  udp_sock.send(config_msg_full.serialize_to_string());
-
-  signal(SIGINT, handle_sigint);
-
-  // set UDP socket to non-blocking now
+  // reply with the full stream configuration
+  const ConfigMsg stream_config(width, height, fps, target_bitrate);
+  udp_sock.send(stream_config.serialize_to_string());
   udp_sock.set_blocking(false);
 
-  // allocate a raw image
-  RawImage raw_img(width, height);
-
-  // initialize the encoder
+  // ===== encoder =====
   Encoder encoder(width, height, fps, output_path);
   encoder.set_target_bitrate(target_bitrate);
   encoder.set_verbose(verbose);
+  RawImage raw_img(width, height);
 
-  // ===== Launch capture thread =====
-  auto *cap_params = new CaptureParams{width, height, fps};
+  // ===== capture thread =====
+  const size_t frame_size = static_cast<size_t>(width) * height * 3 / 2;
+  FrameRing ring(FrameRing::capacity_for(frame_size), frame_size);
+  cerr << "Frame ring: " << ring.capacity() << " slots of "
+       << frame_size << " bytes" << endl;
 
-  pthread_t cap_tid;
-  pthread_create(&cap_tid, nullptr, capture_streaming_loop, cap_params);
-  // cerr << "Launched capture thread." << endl;
+  thread capture_thread(run_capture, cref(cap), ref(ring));
 
+  // ===== event loop =====
   Poller poller;
 
-  // create a periodic timer with the same period as the frame interval
+  // encode one frame per frame interval
   Timerfd fps_timer;
-  const timespec frame_interval {0, static_cast<long>(BILLION / fps)};
+  const timespec frame_interval {0, BILLION / fps};
   fps_timer.set_time(frame_interval, frame_interval);
-  // cerr << "Frame timer set for interval: " << frame_interval.tv_sec << "s " << frame_interval.tv_nsec << "ns" << endl;
 
-  // read a raw frame when the periodic timer fires
-  poller.register_event(fps_timer, Poller::In,[&]() {
-    
+  poller.register_event(fps_timer, Poller::In,
+    [&]()
+    {
       const auto num_exp = fps_timer.read_expirations();
-      if (num_exp > 1) {
-        cerr << "Warning: skipping " << num_exp - 1 << " raw frames" << endl;
+      if (num_exp > 1 and verbose) {
+        cerr << "Warning: timer fell behind by " << num_exp - 1
+             << " frame intervals" << endl;
       }
 
-      // Read frame from ring buffer
-      pthread_mutex_lock(&frame_ring_mutex);
-      while (!frame_ring[frame_ring_tail].ready) {
-        pthread_cond_wait(&frame_available, &frame_ring_mutex);
+      // never block the event loop waiting for the camera; if no frame is
+      // ready, try again on the next tick
+      const uint8_t * frame = ring.try_begin_read();
+      if (not frame) {
+        return;
       }
+      raw_img.copy_from_i420(frame, ring.frame_size());
+      ring.end_read();
 
-      pthread_mutex_lock(&frame_ring[frame_ring_tail].lock);
-      raw_img.copy_from_ringbuffer(frame_ring[frame_ring_tail].data, frame_ring[frame_ring_tail].size);
-      frame_ring[frame_ring_tail].ready = false;
-      pthread_mutex_unlock(&frame_ring[frame_ring_tail].lock);
-
-      frame_ring_tail = (frame_ring_tail + 1) % FRAME_RING_SIZE;
-      pthread_mutex_unlock(&frame_ring_mutex);
-
-      // cerr << "Read raw frame from ring buffer: index=" << frame_ring_tail << endl;
-
-      // compress 'raw_img' into frame 'frame_id' and packetize it
+      // encode and packetize into encoder.send_buf()
       encoder.compress_frame(raw_img);
 
-      // interested in socket being writable if there are datagrams to send
       if (not encoder.send_buf().empty()) {
         poller.activate(udp_sock, Poller::Out);
       }
     }
   );
 
-  // when UDP socket is writable
+  // socket writable: flush queued datagrams (retransmissions come first)
   poller.register_event(udp_sock, Poller::Out,
     [&]()
     {
@@ -254,70 +247,75 @@ int main(int argc, char * argv[])
 
       while (not send_buf.empty()) {
         auto & datagram = send_buf.front();
-
-        // timestamp the sending time before sending
         datagram.send_ts = timestamp_us();
 
-        if (udp_sock.send(datagram.serialize_to_string())) {
-          if (verbose) {
-            cerr << "Sent datagram: frame_id=" << datagram.frame_id
-                 << " frag_id=" << datagram.frag_id
-                 << " frag_cnt=" << datagram.frag_cnt
-                 << " rtx=" << datagram.num_rtx << endl;
-          }
-
-          // move the sent datagram to unacked if not a retransmission
-          if (datagram.num_rtx == 0) {
-            encoder.add_unacked(move(datagram));
-          }
-
-          send_buf.pop_front();
-        } else { // EWOULDBLOCK; try again later
-          datagram.send_ts = 0; // since it wasn't sent successfully
+        if (not udp_sock.send(datagram.serialize_to_string())) {
+          datagram.send_ts = 0; // EWOULDBLOCK: not sent, retry when writable
           break;
         }
+
+        if (verbose) {
+          cerr << "Sent datagram: frame_id=" << datagram.frame_id
+               << " frag_id=" << datagram.frag_id
+               << " frag_cnt=" << datagram.frag_cnt
+               << " rtx=" << datagram.num_rtx << endl;
+        }
+
+        // first transmissions are tracked until acked; retransmissions are
+        // already tracked
+        if (datagram.num_rtx == 0) {
+          encoder.add_unacked(move(datagram));
+        }
+        send_buf.pop_front();
       }
 
-      // not interested in socket being writable if no datagrams to send
       if (send_buf.empty()) {
         poller.deactivate(udp_sock, Poller::Out);
       }
     }
   );
 
-  // when UDP socket is readable
+  // socket readable: ACKs from the receiver
   poller.register_event(udp_sock, Poller::In,
     [&]()
     {
       while (true) {
-        const auto & raw_data = udp_sock.recv();
-
-        if (not raw_data) { // EWOULDBLOCK; try again when data is available
-          break;
+        const auto raw_data = udp_sock.recv();
+        if (not raw_data) {
+          break; // EWOULDBLOCK: drained
         }
-        const shared_ptr<Msg> msg = Msg::parse_from_string(*raw_data);
 
-        // ignore invalid or non-ACK messages
-        if (msg == nullptr or msg->type != Msg::Type::ACK) {
-          return;
+        const shared_ptr<Msg> msg = Msg::parse_from_string(*raw_data);
+        if (not msg) {
+          continue;
+        }
+
+        // the receiver re-sends its request if it missed our reply
+        if (msg->type == Msg::Type::CONFIG) {
+          udp_sock.send(stream_config.serialize_to_string());
+          continue;
         }
 
         const auto ack = dynamic_pointer_cast<AckMsg>(msg);
+        if (not ack) {
+          continue;
+        }
 
         if (verbose) {
           cerr << "Received ACK: frame_id=" << ack->frame_id
                << " frag_id=" << ack->frag_id << endl;
         }
 
-        if (ack->carry_info == 1){
-          cerr << "[Feedback] Bitrate feedback (kbps): " << static_cast<double>(ack->actual_bitrate)/100.0 << endl;
-          // encoder.set_target_bitrate(ack->actual_bitrate);
+        if (ack->has_bitrate_feedback) {
+          // reported only; the adaptive bitrate controller is not in place
+          // yet (see README, "Roadmap")
+          cerr << "[Feedback] receiver goodput (kbps): "
+               << ack->measured_kbps_x100 / 100.0 << endl;
         }
 
-        // RTT estimation, retransmission, etc.
+        // RTT estimation and loss-triggered retransmission
         encoder.handle_ack(ack);
 
-        // send_buf might contain datagrams to be retransmitted now
         if (not encoder.send_buf().empty()) {
           poller.activate(udp_sock, Poller::Out);
         }
@@ -325,7 +323,7 @@ int main(int argc, char * argv[])
     }
   );
 
-  // create a periodic timer for outputting stats every second
+  // print encoder stats every second
   Timerfd stats_timer;
   const timespec stats_interval {1, 0};
   stats_timer.set_time(stats_interval, stats_interval);
@@ -336,17 +334,24 @@ int main(int argc, char * argv[])
       if (stats_timer.read_expirations() == 0) {
         return;
       }
-
-      // output stats every second
       encoder.output_periodic_stats();
+      cerr << "  - Frames queued in ring: " << ring.size()
+           << " (dropped so far: " << ring.dropped() << ")" << endl;
     }
   );
 
-  //main loop
-  while (keep_running) {
-    // cerr << "[POLL] calling poller..." << endl;
-    poller.poll(-1);
+  int exit_code = EXIT_SUCCESS;
+  try {
+    while (not g_stop_requested) {
+      poller.poll(-1); // returns early on SIGINT (EINTR)
+    }
+  } catch (const exception & e) {
+    cerr << "Sender error: " << e.what() << endl;
+    g_stop_requested = true;
+    exit_code = EXIT_FAILURE;
   }
 
-  return EXIT_SUCCESS;
+  cerr << "Stopping..." << endl;
+  capture_thread.join();
+  return exit_code;
 }

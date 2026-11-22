@@ -13,6 +13,7 @@ Datagram::Datagram(const uint32_t _frame_id,
     frag_id(_frag_id), frag_cnt(_frag_cnt), payload(_payload)
 {}
 
+// default MTU of 1500 bytes minus 28 bytes of IPv4 + UDP headers
 size_t Datagram::max_payload = 1500 - 28 - Datagram::HEADER_SIZE;
 
 void Datagram::set_mtu(const size_t mtu)
@@ -73,6 +74,17 @@ shared_ptr<Msg> Msg::parse_from_string(const string & binary)
     return nullptr;
   }
 
+  // WireParser throws std::out_of_range on truncated input; treat that the
+  // same as any other malformed message instead of crashing the program
+  try {
+    return parse_body(binary);
+  } catch (const out_of_range &) {
+    return nullptr;
+  }
+}
+
+shared_ptr<Msg> Msg::parse_body(const string & binary)
+{
   WireParser parser(binary);
   auto type = static_cast<Type>(parser.read_uint8());
 
@@ -81,8 +93,8 @@ shared_ptr<Msg> Msg::parse_from_string(const string & binary)
     ret->frame_id = parser.read_uint32();
     ret->frag_id = parser.read_uint16();
     ret->send_ts = parser.read_uint64();
-    ret->carry_info = parser.read_uint8();
-    ret->actual_bitrate = parser.read_uint32();
+    ret->has_bitrate_feedback = parser.read_uint8();
+    ret->measured_kbps_x100 = parser.read_uint32();
     return ret;
   }
   else if (type == Type::CONFIG) {
@@ -98,14 +110,19 @@ shared_ptr<Msg> Msg::parse_from_string(const string & binary)
   }
 }
 
-AckMsg::AckMsg(const Datagram & datagram, uint8_t carry_info, uint32_t actual_bitrate)
+AckMsg::AckMsg(const Datagram & datagram,
+               const bool has_bitrate_feedback,
+               const uint32_t measured_kbps_x100)
   : Msg(Type::ACK), frame_id(datagram.frame_id), frag_id(datagram.frag_id),
-    send_ts(datagram.send_ts), carry_info(carry_info), actual_bitrate(actual_bitrate)
+    send_ts(datagram.send_ts),
+    has_bitrate_feedback(has_bitrate_feedback ? 1 : 0),
+    measured_kbps_x100(has_bitrate_feedback ? measured_kbps_x100 : 0)
 {}
 
 size_t AckMsg::serialized_size() const
 {
-  return Msg::serialized_size() + sizeof(uint16_t) + sizeof(uint32_t)
+  // frame_id + frag_id + send_ts + has_bitrate_feedback + measured_kbps_x100
+  return Msg::serialized_size() + sizeof(uint32_t) + sizeof(uint16_t)
          + sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint32_t);
 }
 
@@ -118,8 +135,8 @@ string AckMsg::serialize_to_string() const
   binary += put_number(frame_id);
   binary += put_number(frag_id);
   binary += put_number(send_ts);
-  binary += put_number(carry_info);
-  binary += put_number(actual_bitrate);
+  binary += put_number(has_bitrate_feedback);
+  binary += put_number(measured_kbps_x100);
 
   return binary;
 }
