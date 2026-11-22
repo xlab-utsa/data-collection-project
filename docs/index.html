@@ -1,0 +1,866 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>data-collect-system</title>
+  <meta name="description" content="A real-time video data-collection system: Jetson edge devices capture, compress and stream video to a central storage server. The current single-device baseline, a guide to its code, and the roadmap to the goal.">
+  <meta name="author" content="utkrshkmr">
+  <link rel="canonical" href="https://utkrshkmr.github.io/data-collect-system/">
+  <meta property="og:title" content="data-collect-system">
+  <meta property="og:description" content="Edge cameras stream video to a central storage server. Current code, goal and roadmap.">
+  <meta property="og:url" content="https://utkrshkmr.github.io/data-collect-system/">
+  <meta name="color-scheme" content="light dark">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top">data-collect-<span>system</span></a>
+    <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu</button>
+    <nav class="nav-links" id="nav-links" aria-label="Sections">
+      <a href="#overview">Overview</a>
+      <a href="#how">How it works</a>
+      <a href="#codebase">Codebase</a>
+      <a href="#goal">Goal</a>
+      <a href="#status">Status</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#rust">Rust</a>
+      <a href="#setup">Setup</a>
+      <a href="#history">History</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ======================= HERO ======================= -->
+<div class="hero">
+  <div class="wrap">
+    <p class="eyebrow">C++ &middot; V4L2 &middot; VP9 over UDP</p>
+    <h1>data-collect-system</h1>
+    <p class="pitch">Edge devices (NVIDIA Jetson boards with cameras) capture high-quality video, compress it, packetize it and stream it to a central storage server, which reassembles, decodes and records it.</p>
+    <div class="hero-actions">
+      <a class="btn primary" href="https://github.com/utkrshkmr/data-collect-system">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        View on GitHub
+      </a>
+      <a class="btn" href="#codebase">Explore the code</a>
+      <a class="btn" href="#roadmap">See the roadmap</a>
+    </div>
+    <ul class="hero-facts">
+      <li>single-device baseline</li>
+      <li>V4L2 capture</li>
+      <li>libvpx VP9 (CPU)</li>
+      <li>per-datagram ACKs</li>
+      <li>.y4m recording</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ======================= OVERVIEW ======================= -->
+<section id="overview">
+  <div class="wrap">
+    <h2>Overview</h2>
+    <p class="lead">The project has a working starting point and a clear destination. This page explains the code as it is today, describes what the finished system should do, and lists the steps in between.</p>
+
+    <div class="two-col">
+      <div class="card">
+        <div class="num">TODAY</div>
+        <h4>A working single-device baseline</h4>
+        <p>One sender captures from a camera, encodes with VP9 on the CPU (libvpx), and streams over UDP with ACKs and retransmission. One receiver reassembles, decodes and records the stream to disk.</p>
+      </div>
+      <div class="card">
+        <div class="num">GOAL</div>
+        <h4>A fleet of edge cameras feeding one server</h4>
+        <p>Many Jetson devices capture continuously, encode on the GPU, transmit on separate CPU cores with the stages overlapping, share the server's bandwidth fairly, and adapt to congestion. See <a href="#goal">Goal</a>.</p>
+      </div>
+    </div>
+
+    <h3>How to use this page</h3>
+    <ol class="steps">
+      <li><strong>Understand the current code.</strong> Read <a href="#how">How it works</a>, then explore the <a href="#codebase">Codebase</a> graph and follow the suggested reading order.</li>
+      <li><strong>Get it running.</strong> Build it and run sender and receiver on one machine with a virtual camera (<a href="#setup">Setup &amp; testing</a>).</li>
+      <li><strong>Pick a roadmap item.</strong> Each <a href="#roadmap">roadmap</a> item says what to build, how we know it is done, and what to read up on. The design is up to you.</li>
+      <li><strong>Measure before and after every change,</strong> and add a unit test for every module you change.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ======================= HOW IT WORKS ======================= -->
+<section id="how" class="alt">
+  <div class="wrap">
+    <h2>How the current code works</h2>
+    <p class="lead">A sender on the edge device and a receiver on the storage server, talking over UDP. The diagram follows the README.</p>
+
+    <figure class="scroll-fig">
+      <svg class="dg" viewBox="0 0 960 480" role="img" aria-labelledby="how-t">
+        <title id="how-t">Current architecture: the sender's capture thread fills a FrameRing; its main thread encodes, packetizes, sends and handles ACKs. The receiver's main thread receives, ACKs and reassembles; a worker thread decodes, records and displays.</title>
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrowhead" d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrowhead-2" d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrowhead-3" d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+
+        <!-- sender -->
+        <rect class="box" x="10" y="10" width="420" height="460" rx="10"/>
+        <text class="title" x="26" y="36">SENDER (edge device)</text>
+
+        <text class="small" x="26" y="62">capture thread</text>
+        <rect class="cap" x="26" y="70" width="250" height="34" rx="6"/><text x="38" y="92">V4L2 camera (YUYV 4:2:2, mmap)</text>
+        <rect class="cap" x="26" y="122" width="250" height="34" rx="6"/><text x="38" y="144">swscale &rarr; I420</text>
+        <rect class="free" x="296" y="122" width="120" height="50" rx="6"/><text x="306" y="142">preview window</text><text class="small" x="306" y="160">640x480 RGB565</text>
+        <rect class="free" x="26" y="176" width="390" height="34" rx="6"/><text x="38" y="198">FrameRing (I420 slots, drop if full)</text>
+        <path class="line" d="M151,104 L151,120" marker-end="url(#ah)"/>
+        <path class="line" d="M276,139 L294,145" marker-end="url(#ah)"/>
+        <path class="line" d="M151,156 L151,174" marker-end="url(#ah)"/>
+
+        <text class="small" x="26" y="236">main thread (event loop)</text>
+        <rect class="enc" x="26" y="244" width="390" height="34" rx="6"/><text x="38" y="266">timer @ fps &rarr; VP9 encode (libvpx, CBR)</text>
+        <rect class="tx" x="26" y="296" width="390" height="34" rx="6"/><text x="38" y="318">split into MTU-sized Datagrams</text>
+        <rect class="tx" x="26" y="348" width="390" height="106" rx="6"/>
+        <text x="38" y="370">unacked map &larr; ACKs</text>
+        <text class="small" x="50" y="392">RTT (min / EWMA)</text>
+        <text class="small" x="50" y="410">retransmit datagrams older than an ACK</text>
+        <text class="small" x="50" y="428">give up after 1 s &rarr; force a key frame</text>
+        <path class="line" d="M151,210 L151,242" marker-end="url(#ah)"/>
+        <path class="line" d="M151,278 L151,294" marker-end="url(#ah)"/>
+
+        <!-- network -->
+        <path class="line-2" d="M416,313 C470,313 470,87 528,87" marker-end="url(#ah2)"/>
+        <path class="line-3 dash" d="M528,104 C480,104 470,372 418,372" marker-end="url(#ah3)"/>
+        <text class="small center" x="472" y="236">UDP</text>
+        <text class="small" x="440" y="300">Datagrams</text>
+        <text class="small" x="440" y="392">ACKs</text>
+
+        <!-- receiver -->
+        <rect class="box" x="530" y="10" width="420" height="460" rx="10"/>
+        <text class="title" x="546" y="36">RECEIVER (storage server)</text>
+        <text class="small" x="546" y="62">main thread</text>
+        <rect class="tx" x="546" y="70" width="390" height="50" rx="6"/><text x="558" y="90">UDP recv &rarr; ACK every datagram</text><text class="small" x="558" y="108">(+ goodput once/s)</text>
+        <rect class="enc" x="546" y="138" width="390" height="50" rx="6"/><text x="558" y="158">reassemble frames</text><text class="small" x="558" y="176">skip ahead to a key frame if a frame cannot be completed</text>
+        <path class="line" d="M741,120 L741,136" marker-end="url(#ah)"/>
+
+        <text class="small" x="546" y="226">worker thread</text>
+        <rect class="enc" x="546" y="234" width="390" height="34" rx="6"/><text x="558" y="256">VP9 decode</text>
+        <rect class="cap" x="546" y="300" width="185" height="50" rx="6"/><text x="558" y="322">record</text><text class="small mono" x="558" y="340">data/output_&lt;time&gt;.y4m</text>
+        <rect class="free" x="751" y="300" width="185" height="50" rx="6"/><text x="763" y="322">SDL window</text><text class="small" x="763" y="340">--lazy 0</text>
+        <path class="line" d="M741,188 L741,232" marker-end="url(#ah)"/>
+        <path class="line" d="M700,268 L640,298" marker-end="url(#ah)"/>
+        <path class="line" d="M780,268 L840,298" marker-end="url(#ah)"/>
+      </svg>
+      <figcaption>Solid: datagrams from sender to receiver. Dashed: ACKs back, which also carry the goodput measurement about once a second.</figcaption>
+    </figure>
+
+    <ol class="steps">
+      <li><strong>Handshake.</strong> The receiver sends a <code>ConfigMsg</code> that carries only the target bitrate, and re-sends it every 500 ms until the sender answers. The sender replies with width, height, fps and bitrate.</li>
+      <li><strong>Capture</strong> (<code>capture.cc</code>). The camera delivers packed YUYV. Each frame is converted to planar I420 (with libswscale) directly into a free slot of the <code>FrameRing</code>. If the encoder falls behind and the ring is full, the new frame is dropped and counted.</li>
+      <li><strong>Encode and send</strong> (<code>video_sender.cc</code>, <code>encoder.cc</code>). A timer fires once per frame interval. Each tick takes the oldest frame from the ring and encodes it on the main thread: libvpx VP9, real-time single-pass CBR with key frames only on demand. The encoded frame is split into datagrams of at most MTU &minus; 28 &minus; 17 bytes.</li>
+      <li><strong>Reliability.</strong> The receiver ACKs every datagram. When an ACK arrives, unacked datagrams sent before it are queued for retransmission, up to 3 times and at most once per RTT. If the oldest unacked datagram is more than 1 s old, the sender gives up, clears its queues and forces a key frame.</li>
+      <li><strong>Feedback.</strong> About once a second the receiver piggy-backs its measured goodput (kbps &times; 100) on an ACK. The sender only logs it: no adaptation exists yet.</li>
+      <li><strong>Decode and record</strong> (<code>decoder.cc</code>). Complete frames go in order to a worker thread, which decodes them, appends them to <code>data/output_YYYYmmdd_HHMMSS.y4m</code> and, with <code>--lazy 0</code>, also displays them. On Ctrl+C it finishes the queued frames and closes the file.</li>
+    </ol>
+
+    <h3>Threads today</h3>
+    <div class="two-col">
+      <div class="card">
+        <h4>Sender</h4>
+        <ul class="plain">
+          <li><strong>capture thread</strong>: camera &rarr; I420 &rarr; <code>FrameRing</code></li>
+          <li><strong>preview thread</strong>: the preview window</li>
+          <li><strong>main thread</strong>: encodes <em>and</em> does all network I/O</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h4>Receiver</h4>
+        <ul class="plain">
+          <li><strong>main (network) thread</strong>: receive, ACK, reassemble</li>
+          <li><strong>decode/record worker</strong>: decode, write <code>.y4m</code>, display</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>Wire protocol</h3>
+    <p>All integers are big-endian; see <code>protocol.hh</code>.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Message</th><th>Direction</th><th>Fields</th></tr></thead>
+        <tbody>
+          <tr><td><code>Datagram</code></td><td>sender &rarr; receiver</td><td>frame_id, frame_type, frag_id, frag_cnt, send_ts, payload</td></tr>
+          <tr><td><code>AckMsg</code></td><td>receiver &rarr; sender</td><td>type, frame_id, frag_id, send_ts (echoed), has_bitrate_feedback, measured_kbps_x100</td></tr>
+          <tr><td><code>ConfigMsg</code></td><td>both</td><td>type, width, height, frame_rate, target_bitrate</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= CODEBASE ======================= -->
+<section id="codebase">
+  <div class="wrap">
+    <h2>Codebase</h2>
+    <p class="lead">Every source file starts with a comment explaining its role, and the functions are documented in place. The graph shows every module and what it includes.</p>
+
+    <figure class="graph-fig">
+      <div class="graph-scroll">
+<svg class="dg cg" id="codegraph" viewBox="0 0 1060 542" role="img" aria-labelledby="cg-t">
+<title id="cg-t">Module dependency graph of the current codebase, from #include relationships: binaries, src/app, src/video, src/util and external libraries.</title>
+<text class="cg-head" x="10" y="24">binaries</text>
+<text class="cg-head" x="215" y="24">src/app + tools</text>
+<text class="cg-head" x="455" y="24">src/video</text>
+<text class="cg-head" x="695" y="24">src/util</text>
+<text class="cg-head" x="930" y="24">external</text>
+<g class="cg-edges">
+<path class="edge e-dep" data-from="app/capture" data-to="app/common" d="M365,171 C405,171 405,307 365,307"/>
+<path class="edge e-dep" data-from="app/capture" data-to="app/frame_ring" d="M365,171 C387,171 387,205 365,205"/>
+<path class="edge e-dep" data-from="app/capture" data-to="util/exception" d="M365,171 C530,171 530,273 695,273"/>
+<path class="edge e-ext" data-from="app/capture" data-to="ext/FFmpeg" d="M365,171 C648,171 648,279 930,279"/>
+<path class="edge e-ext" data-from="app/capture" data-to="ext/SDL2" d="M365,171 C648,171 648,204 930,204"/>
+<path class="edge e-ext" data-from="app/capture" data-to="ext/V4L2 (kernel)" d="M365,171 C648,171 648,353 930,353"/>
+<path class="edge e-dep" data-from="app/common" data-to="app/protocol" d="M365,307 C387,307 387,273 365,273"/>
+<path class="edge e-dep" data-from="app/common" data-to="util/address" d="M365,307 C530,307 530,375 695,375"/>
+<path class="edge e-dep" data-from="app/common" data-to="util/exception" d="M365,307 C530,307 530,273 695,273"/>
+<path class="edge e-dep" data-from="app/common" data-to="util/udp_socket" d="M365,307 C530,307 530,443 695,443"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="app/common" d="M365,375 C393,375 393,307 365,307"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="app/protocol" d="M365,375 C399,375 399,273 365,273"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="util/conversion" d="M365,375 C530,375 530,137 695,137"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="util/exception" d="M365,375 C530,375 530,273 695,273"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="util/file_descriptor" d="M365,375 C530,375 530,239 695,239"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="util/timestamp" d="M365,375 C530,375 530,103 695,103"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="video/image" d="M365,375 C410,375 410,375 455,375"/>
+<path class="edge e-dep" data-from="app/decoder" data-to="video/sdl" d="M365,375 C410,375 410,341 455,341"/>
+<path class="edge e-ext" data-from="app/decoder" data-to="ext/libvpx" d="M365,375 C648,375 648,129 930,129"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="app/protocol" d="M365,239 C387,239 387,273 365,273"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="util/conversion" d="M365,239 C530,239 530,137 695,137"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="util/exception" d="M365,239 C530,239 530,273 695,273"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="util/file_descriptor" d="M365,239 C530,239 530,239 695,239"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="util/timestamp" d="M365,239 C530,239 530,103 695,103"/>
+<path class="edge e-dep" data-from="app/encoder" data-to="video/image" d="M365,239 C410,239 410,375 455,375"/>
+<path class="edge e-ext" data-from="app/encoder" data-to="ext/libvpx" d="M365,239 C648,239 648,129 930,129"/>
+<path class="edge e-dep" data-from="app/protocol" data-to="util/serialization" d="M365,273 C530,273 530,341 695,341"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="app/common" d="M365,341 C387,341 387,307 365,307"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="app/decoder" d="M365,341 C387,341 387,375 365,375"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="app/protocol" d="M365,341 C393,341 393,273 365,273"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="util/conversion" d="M365,341 C530,341 530,137 695,137"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="util/poller" d="M365,341 C530,341 530,171 695,171"/>
+<path class="edge e-dep" data-from="app/video_receiver" data-to="util/udp_socket" d="M365,341 C530,341 530,443 695,443"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="app/capture" d="M365,137 C387,137 387,171 365,171"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="app/common" d="M365,137 C412,137 412,307 365,307"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="app/encoder" d="M365,137 C399,137 399,239 365,239"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="app/frame_ring" d="M365,137 C393,137 393,205 365,205"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="app/protocol" d="M365,137 C405,137 405,273 365,273"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="util/conversion" d="M365,137 C530,137 530,137 695,137"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="util/poller" d="M365,137 C530,137 530,171 695,171"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="util/timerfd" d="M365,137 C530,137 530,69 695,69"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="util/timestamp" d="M365,137 C530,137 530,103 695,103"/>
+<path class="edge e-dep" data-from="app/video_sender" data-to="util/udp_socket" d="M365,137 C530,137 530,443 695,443"/>
+<path class="edge e-dep" data-from="util/epoller" data-to="util/exception" d="M855,205 C883,205 883,273 855,273"/>
+<path class="edge e-dep" data-from="util/epoller" data-to="util/file_descriptor" d="M855,205 C877,205 877,239 855,239"/>
+<path class="edge e-dep" data-from="util/file_descriptor" data-to="util/exception" d="M855,239 C877,239 877,273 855,273"/>
+<path class="edge e-dep" data-from="util/mmap" data-to="util/exception" d="M855,307 C877,307 877,273 855,273"/>
+<path class="edge e-dep" data-from="util/poller" data-to="util/exception" d="M855,171 C889,171 889,273 855,273"/>
+<path class="edge e-dep" data-from="util/poller" data-to="util/file_descriptor" d="M855,171 C883,171 883,239 855,239"/>
+<path class="edge e-dep" data-from="util/socket" data-to="util/address" d="M855,409 C877,409 877,375 855,375"/>
+<path class="edge e-dep" data-from="util/socket" data-to="util/exception" d="M855,409 C895,409 895,273 855,273"/>
+<path class="edge e-dep" data-from="util/socket" data-to="util/file_descriptor" d="M855,409 C902,409 902,239 855,239"/>
+<path class="edge e-dep" data-from="util/tcp_socket" data-to="util/exception" d="M855,477 C908,477 908,273 855,273"/>
+<path class="edge e-dep" data-from="util/tcp_socket" data-to="util/socket" d="M855,477 C883,477 883,409 855,409"/>
+<path class="edge e-dep" data-from="util/timerfd" data-to="util/conversion" d="M855,69 C883,69 883,137 855,137"/>
+<path class="edge e-dep" data-from="util/timerfd" data-to="util/exception" d="M855,69 C908,69 908,273 855,273"/>
+<path class="edge e-dep" data-from="util/timerfd" data-to="util/file_descriptor" d="M855,69 C902,69 902,239 855,239"/>
+<path class="edge e-dep" data-from="util/udp_socket" data-to="util/address" d="M855,443 C883,443 883,375 855,375"/>
+<path class="edge e-dep" data-from="util/udp_socket" data-to="util/exception" d="M855,443 C902,443 902,273 855,273"/>
+<path class="edge e-dep" data-from="util/udp_socket" data-to="util/socket" d="M855,443 C877,443 877,409 855,409"/>
+<path class="edge e-ext" data-from="video/image" data-to="ext/libvpx" d="M605,375 C768,375 768,129 930,129"/>
+<path class="edge e-dep" data-from="video/sdl" data-to="video/image" d="M605,341 C627,341 627,375 605,375"/>
+<path class="edge e-ext" data-from="video/sdl" data-to="ext/SDL2" d="M605,341 C768,341 768,204 930,204"/>
+<path class="edge e-dep" data-from="video/v4l2" data-to="util/exception" d="M605,239 C650,239 650,273 695,273"/>
+<path class="edge e-dep" data-from="video/v4l2" data-to="util/file_descriptor" d="M605,239 C650,239 650,239 695,239"/>
+<path class="edge e-dep" data-from="video/v4l2" data-to="util/mmap" d="M605,239 C650,239 650,307 695,307"/>
+<path class="edge e-dep" data-from="video/v4l2" data-to="video/video_input" d="M605,239 C633,239 633,307 605,307"/>
+<path class="edge e-ext" data-from="video/v4l2" data-to="ext/V4L2 (kernel)" d="M605,239 C768,239 768,353 930,353"/>
+<path class="edge e-dep" data-from="video/video_input" data-to="video/image" d="M605,307 C633,307 633,375 605,375"/>
+<path class="edge e-dep" data-from="video/webcam" data-to="util/conversion" d="M605,205 C650,205 650,137 695,137"/>
+<path class="edge e-dep" data-from="video/webcam" data-to="util/poller" d="M605,205 C650,205 650,171 695,171"/>
+<path class="edge e-dep" data-from="video/webcam" data-to="video/image" d="M605,205 C652,205 652,375 605,375"/>
+<path class="edge e-dep" data-from="video/webcam" data-to="video/sdl" d="M605,205 C645,205 645,341 605,341"/>
+<path class="edge e-dep" data-from="video/webcam" data-to="video/v4l2" d="M605,205 C627,205 627,239 605,239"/>
+<path class="edge e-dep" data-from="video/yuv4mpeg" data-to="util/conversion" d="M605,273 C650,273 650,137 695,137"/>
+<path class="edge e-dep" data-from="video/yuv4mpeg" data-to="util/exception" d="M605,273 C650,273 650,273 695,273"/>
+<path class="edge e-dep" data-from="video/yuv4mpeg" data-to="util/file_descriptor" d="M605,273 C650,273 650,239 695,239"/>
+<path class="edge e-dep" data-from="video/yuv4mpeg" data-to="util/split" d="M605,273 C650,273 650,511 695,511"/>
+<path class="edge e-dep" data-from="video/yuv4mpeg" data-to="video/video_input" d="M605,273 C627,273 627,307 605,307"/>
+<path class="edge e-ext" data-from="tools/capture_to_disk" data-to="ext/FFmpeg" d="M365,443 C648,443 648,279 930,279"/>
+<path class="edge e-ext" data-from="tools/capture_to_disk" data-to="ext/SDL2" d="M365,443 C648,443 648,204 930,204"/>
+<path class="edge e-ext" data-from="tools/capture_to_disk" data-to="ext/V4L2 (kernel)" d="M365,443 C648,443 648,353 930,353"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/video_sender" d="M150,109 C182,109 182,137 215,137"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/capture" d="M150,109 C182,109 182,171 215,171"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/encoder" d="M150,109 C182,109 182,239 215,239"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/frame_ring" d="M150,109 C182,109 182,205 215,205"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/protocol" d="M150,109 C182,109 182,273 215,273"/>
+<path class="edge e-bin" data-from="bin/video_sender" data-to="app/common" d="M150,109 C182,109 182,307 215,307"/>
+<path class="edge e-bin" data-from="bin/video_receiver" data-to="app/video_receiver" d="M150,184 C182,184 182,341 215,341"/>
+<path class="edge e-bin" data-from="bin/video_receiver" data-to="app/decoder" d="M150,184 C182,184 182,375 215,375"/>
+<path class="edge e-bin" data-from="bin/video_receiver" data-to="app/protocol" d="M150,184 C182,184 182,273 215,273"/>
+<path class="edge e-bin" data-from="bin/video_receiver" data-to="app/common" d="M150,184 C182,184 182,307 215,307"/>
+<path class="edge e-bin" data-from="bin/webcam" data-to="video/webcam" d="M150,259 C302,259 302,205 455,205"/>
+<path class="edge e-bin" data-from="bin/capture_to_disk" data-to="tools/capture_to_disk" d="M150,333 C182,333 182,443 215,443"/>
+</g><g class="cg-nodes">
+<g class="node g-bin" tabindex="0" data-id="bin/video_sender" data-desc="Binary src/app/video_sender. Links libvideo.a and libutil.a, plus libvpx, SDL2 and FFmpeg." data-files=""><title>bin/video_sender: Binary src/app/video_sender. Links libvideo.a and libutil.a, plus libvpx, SDL2 and FFmpeg.</title><rect x="10" y="96" width="140" height="26" rx="6"/><text class="mono" x="20" y="113">video_sender</text></g>
+<g class="node g-bin" tabindex="0" data-id="bin/video_receiver" data-desc="Binary src/app/video_receiver. Links libvideo.a and libutil.a, plus libvpx and SDL2." data-files=""><title>bin/video_receiver: Binary src/app/video_receiver. Links libvideo.a and libutil.a, plus libvpx and SDL2.</title><rect x="10" y="171" width="140" height="26" rx="6"/><text class="mono" x="20" y="188">video_receiver</text></g>
+<g class="node g-bin" tabindex="0" data-id="bin/webcam" data-desc="Binary src/video/webcam: a camera viewer." data-files=""><title>bin/webcam: Binary src/video/webcam: a camera viewer.</title><rect x="10" y="246" width="140" height="26" rx="6"/><text class="mono" x="20" y="263">webcam</text></g>
+<g class="node g-bin" tabindex="0" data-id="bin/capture_to_disk" data-desc="Standalone tool, built separately (see the comment at the top of tools/capture_to_disk.c)." data-files=""><title>bin/capture_to_disk: Standalone tool, built separately (see the comment at the top of tools/capture_to_disk.c).</title><rect x="10" y="320" width="140" height="26" rx="6"/><text class="mono" x="20" y="337">capture_to_disk</text></g>
+<g class="node g-app" tabindex="0" data-id="app/video_sender" data-desc="Sender main: option parsing, handshake, and the event loop (frame timer, socket readable/writable, stats timer)." data-files="video_sender.cc"><title>app/video_sender: Sender main: option parsing, handshake, and the event loop (frame timer, socket readable/writable, stats timer).</title><rect x="215" y="124" width="150" height="26" rx="6"/><text class="mono" x="225" y="141">video_sender</text></g>
+<g class="node g-app" tabindex="0" data-id="app/capture" data-desc="Camera capture thread (V4L2 mmap streaming), YUYV to I420 conversion with libswscale, and the preview window." data-files="capture.cc, capture.hh"><title>app/capture: Camera capture thread (V4L2 mmap streaming), YUYV to I420 conversion with libswscale, and the preview window.</title><rect x="215" y="158" width="150" height="26" rx="6"/><text class="mono" x="225" y="175">capture</text></g>
+<g class="node g-app" tabindex="0" data-id="app/frame_ring" data-desc="Ring of preallocated raw I420 frame slots between the capture thread and the encoder; drops the new frame when full." data-files="frame_ring.cc, frame_ring.hh"><title>app/frame_ring: Ring of preallocated raw I420 frame slots between the capture thread and the encoder; drops the new frame when full.</title><rect x="215" y="192" width="150" height="26" rx="6"/><text class="mono" x="225" y="209">frame_ring</text></g>
+<g class="node g-app" tabindex="0" data-id="app/encoder" data-desc="VP9 encoder (libvpx), packetization, unacked tracking, RTT, retransmission and key-frame recovery." data-files="encoder.cc, encoder.hh"><title>app/encoder: VP9 encoder (libvpx), packetization, unacked tracking, RTT, retransmission and key-frame recovery.</title><rect x="215" y="226" width="150" height="26" rx="6"/><text class="mono" x="225" y="243">encoder</text></g>
+<g class="node g-app" tabindex="0" data-id="app/protocol" data-desc="Wire format: Datagram, AckMsg and ConfigMsg, all integers big-endian." data-files="protocol.cc, protocol.hh"><title>app/protocol: Wire format: Datagram, AckMsg and ConfigMsg, all integers big-endian.</title><rect x="215" y="260" width="150" height="26" rx="6"/><text class="mono" x="225" y="277">protocol</text></g>
+<g class="node g-app" tabindex="0" data-id="app/common" data-desc="Stop-signal handling and the handshake helper shared by sender and receiver." data-files="common.cc, common.hh"><title>app/common: Stop-signal handling and the handshake helper shared by sender and receiver.</title><rect x="215" y="294" width="150" height="26" rx="6"/><text class="mono" x="225" y="311">common</text></g>
+<g class="node g-app" tabindex="0" data-id="app/video_receiver" data-desc="Receiver main: option parsing, handshake, and the receive/ACK loop." data-files="video_receiver.cc"><title>app/video_receiver: Receiver main: option parsing, handshake, and the receive/ACK loop.</title><rect x="215" y="328" width="150" height="26" rx="6"/><text class="mono" x="225" y="345">video_receiver</text></g>
+<g class="node g-app" tabindex="0" data-id="app/decoder" data-desc="Frame reassembly, skip-ahead recovery, goodput measurement, and the decode/record/display worker." data-files="decoder.cc, decoder.hh"><title>app/decoder: Frame reassembly, skip-ahead recovery, goodput measurement, and the decode/record/display worker.</title><rect x="215" y="362" width="150" height="26" rx="6"/><text class="mono" x="225" y="379">decoder</text></g>
+<g class="node g-tools" tabindex="0" data-id="tools/capture_to_disk" data-desc="Standalone recorder: camera to .y4m with preview, no encoding and no network. Built separately." data-files="capture_to_disk.c"><title>tools/capture_to_disk: Standalone recorder: camera to .y4m with preview, no encoding and no network. Built separately.</title><rect x="215" y="430" width="150" height="26" rx="6"/><text class="mono" x="225" y="447">capture_to_disk</text></g>
+<g class="node g-video" tabindex="0" data-id="video/webcam" data-desc="webcam viewer: shows a V4L2 camera in an SDL window." data-files="webcam.cc"><title>video/webcam: webcam viewer: shows a V4L2 camera in an SDL window.</title><rect x="455" y="192" width="150" height="26" rx="6"/><text class="mono" x="465" y="209">webcam</text></g>
+<g class="node g-video" tabindex="0" data-id="video/v4l2" data-desc="V4L2 camera class with memory-mapped buffers, used by the webcam viewer." data-files="v4l2.cc, v4l2.hh"><title>video/v4l2: V4L2 camera class with memory-mapped buffers, used by the webcam viewer.</title><rect x="455" y="226" width="150" height="26" rx="6"/><text class="mono" x="465" y="243">v4l2</text></g>
+<g class="node g-video" tabindex="0" data-id="video/yuv4mpeg" data-desc="Reader for Y4M (YUV4MPEG2) files." data-files="yuv4mpeg.cc, yuv4mpeg.hh"><title>video/yuv4mpeg: Reader for Y4M (YUV4MPEG2) files.</title><rect x="455" y="260" width="150" height="26" rx="6"/><text class="mono" x="465" y="277">yuv4mpeg</text></g>
+<g class="node g-video" tabindex="0" data-id="video/video_input" data-desc="Interface for sources of raw frames, implemented by the V4L2 and Y4M readers." data-files="video_input.hh"><title>video/video_input: Interface for sources of raw frames, implemented by the V4L2 and Y4M readers.</title><rect x="455" y="294" width="150" height="26" rx="6"/><text class="mono" x="465" y="311">video_input</text></g>
+<g class="node g-video" tabindex="0" data-id="video/sdl" data-desc="SDL window that displays frames." data-files="sdl.cc, sdl.hh"><title>video/sdl: SDL window that displays frames.</title><rect x="455" y="328" width="150" height="26" rx="6"/><text class="mono" x="465" y="345">sdl</text></g>
+<g class="node g-video" tabindex="0" data-id="video/image" data-desc="RawImage: a wrapper around a libvpx vpx_image in I420 format." data-files="image.cc, image.hh"><title>video/image: RawImage: a wrapper around a libvpx vpx_image in I420 format.</title><rect x="455" y="362" width="150" height="26" rx="6"/><text class="mono" x="465" y="379">image</text></g>
+<g class="node g-util" tabindex="0" data-id="util/timerfd" data-desc="Timer file descriptor (timerfd); the sender&#x27;s event loop uses it for its timers." data-files="timerfd.cc, timerfd.hh"><title>util/timerfd: Timer file descriptor (timerfd); the sender&#x27;s event loop uses it for its timers.</title><rect x="695" y="56" width="160" height="26" rx="6"/><text class="mono" x="705" y="73">timerfd</text></g>
+<g class="node g-util" tabindex="0" data-id="util/timestamp" data-desc="Current time in nanoseconds, microseconds or milliseconds." data-files="timestamp.cc, timestamp.hh"><title>util/timestamp: Current time in nanoseconds, microseconds or milliseconds.</title><rect x="695" y="90" width="160" height="26" rx="6"/><text class="mono" x="705" y="107">timestamp</text></g>
+<g class="node g-util" tabindex="0" data-id="util/conversion" data-desc="Safe conversions between strings and numbers and between integer types (used for option parsing)." data-files="conversion.cc, conversion.hh"><title>util/conversion: Safe conversions between strings and numbers and between integer types (used for option parsing).</title><rect x="695" y="124" width="160" height="26" rx="6"/><text class="mono" x="705" y="141">conversion</text></g>
+<g class="node g-util" tabindex="0" data-id="util/poller" data-desc="Event loop on poll(2): callbacks for readable/writable file descriptors. Used by the apps." data-files="poller.cc, poller.hh"><title>util/poller: Event loop on poll(2): callbacks for readable/writable file descriptors. Used by the apps.</title><rect x="695" y="158" width="160" height="26" rx="6"/><text class="mono" x="705" y="175">poller</text></g>
+<g class="node g-util" tabindex="0" data-id="util/epoller" data-desc="Event loop on epoll(7) with the same interface as Poller. Currently unused by the apps." data-files="epoller.cc, epoller.hh"><title>util/epoller: Event loop on epoll(7) with the same interface as Poller. Currently unused by the apps.</title><rect x="695" y="192" width="160" height="26" rx="6"/><text class="mono" x="705" y="209">epoller</text></g>
+<g class="node g-util" tabindex="0" data-id="util/file_descriptor" data-desc="FileDescriptor: RAII owner of a Unix file descriptor, with read/write helpers." data-files="file_descriptor.cc, file_descriptor.hh"><title>util/file_descriptor: FileDescriptor: RAII owner of a Unix file descriptor, with read/write helpers.</title><rect x="695" y="226" width="160" height="26" rx="6"/><text class="mono" x="705" y="243">file_descriptor</text></g>
+<g class="node g-util" tabindex="0" data-id="util/exception" data-desc="Helpers that turn C-style error returns into C++ exceptions. Used almost everywhere." data-files="exception.hh"><title>util/exception: Helpers that turn C-style error returns into C++ exceptions. Used almost everywhere.</title><rect x="695" y="260" width="160" height="26" rx="6"/><text class="mono" x="705" y="277">exception</text></g>
+<g class="node g-util" tabindex="0" data-id="util/mmap" data-desc="MMap: RAII owner of a memory mapping (mmap/munmap). Used by the V4L2 class." data-files="mmap.cc, mmap.hh"><title>util/mmap: MMap: RAII owner of a memory mapping (mmap/munmap). Used by the V4L2 class.</title><rect x="695" y="294" width="160" height="26" rx="6"/><text class="mono" x="705" y="311">mmap</text></g>
+<g class="node g-util" tabindex="0" data-id="util/serialization" data-desc="Big-endian serialization: values to and from network byte order." data-files="serialization.cc, serialization.hh"><title>util/serialization: Big-endian serialization: values to and from network byte order.</title><rect x="695" y="328" width="160" height="26" rx="6"/><text class="mono" x="705" y="345">serialization</text></g>
+<g class="node g-util" tabindex="0" data-id="util/address" data-desc="Address: an IPv4 socket address (IP and port), a value wrapper around sockaddr." data-files="address.cc, address.hh"><title>util/address: Address: an IPv4 socket address (IP and port), a value wrapper around sockaddr.</title><rect x="695" y="362" width="160" height="26" rx="6"/><text class="mono" x="705" y="379">address</text></g>
+<g class="node g-util" tabindex="0" data-id="util/socket" data-desc="Base socket class: socket options, bind and connect." data-files="socket.cc, socket.hh"><title>util/socket: Base socket class: socket options, bind and connect.</title><rect x="695" y="396" width="160" height="26" rx="6"/><text class="mono" x="705" y="413">socket</text></g>
+<g class="node g-util" tabindex="0" data-id="util/udp_socket" data-desc="UDP socket: send and receive datagrams, including non-blocking mode." data-files="udp_socket.cc, udp_socket.hh"><title>util/udp_socket: UDP socket: send and receive datagrams, including non-blocking mode.</title><rect x="695" y="430" width="160" height="26" rx="6"/><text class="mono" x="705" y="447">udp_socket</text></g>
+<g class="node g-util" tabindex="0" data-id="util/tcp_socket" data-desc="TCP socket: listen and accept. Not included by the apps." data-files="tcp_socket.cc, tcp_socket.hh"><title>util/tcp_socket: TCP socket: listen and accept. Not included by the apps.</title><rect x="695" y="464" width="160" height="26" rx="6"/><text class="mono" x="705" y="481">tcp_socket</text></g>
+<g class="node g-util" tabindex="0" data-id="util/split" data-desc="String splitting helper, used by the Y4M reader." data-files="split.cc, split.hh"><title>util/split: String splitting helper, used by the Y4M reader.</title><rect x="695" y="498" width="160" height="26" rx="6"/><text class="mono" x="705" y="515">split</text></g>
+<g class="node g-ext" tabindex="0" data-id="ext/libvpx" data-desc="External library: VP9 encoder and decoder." data-files=""><title>ext/libvpx: External library: VP9 encoder and decoder.</title><rect x="930" y="116" width="120" height="26" rx="13"/><text class="mono" x="940" y="133">libvpx</text></g>
+<g class="node g-ext" tabindex="0" data-id="ext/SDL2" data-desc="External library: windows and display." data-files=""><title>ext/SDL2: External library: windows and display.</title><rect x="930" y="191" width="120" height="26" rx="13"/><text class="mono" x="940" y="208">SDL2</text></g>
+<g class="node g-ext" tabindex="0" data-id="ext/FFmpeg" data-desc="External library (libswscale, libavutil): pixel-format conversion and scaling." data-files=""><title>ext/FFmpeg: External library (libswscale, libavutil): pixel-format conversion and scaling.</title><rect x="930" y="266" width="120" height="26" rx="13"/><text class="mono" x="940" y="283">FFmpeg</text></g>
+<g class="node g-ext" tabindex="0" data-id="ext/V4L2 (kernel)" data-desc="Linux kernel camera interface (Video4Linux2)." data-files=""><title>ext/V4L2 (kernel): Linux kernel camera interface (Video4Linux2).</title><rect x="930" y="340" width="120" height="26" rx="13"/><text class="mono" x="940" y="357">V4L2 (kernel)</text></g>
+</g></svg>
+      </div>
+      <div class="graph-info" id="graph-info" aria-live="polite">
+        <strong>Hover over or tap a module</strong> to highlight what it includes and what includes it. Tap again to clear.
+      </div>
+      <div class="legend">
+        <span><i class="l-bin"></i>binary</span>
+        <span><i class="l-enc"></i>src/app</span>
+        <span><i class="l-bad"></i>tools</span>
+        <span><i class="l-tx"></i>src/video</span>
+        <span><i class="l-cap"></i>src/util</span>
+        <span><i class="l-ext"></i>external library</span>
+        <span><i class="l-out"></i>includes (dependency)</span>
+        <span><i class="l-in"></i>included by (dependent)</span>
+      </div>
+      <figcaption>Generated from the project's <code>#include</code> relationships (plus the external libraries each module uses). Edges run from the including module to the included one; edges that stay inside a column curve out to its right. Lines from a binary go to the modules it is built from.</figcaption>
+    </figure>
+
+    <h3>What each binary is built from</h3>
+    <div class="bin-strip">
+<div class="bin-row"><div class="bin-name"><code>video_sender</code></div><div class="bin-chips"><span class="chip g-app">video_sender</span><span class="chip g-app">capture</span><span class="chip g-app">encoder</span><span class="chip g-app">frame_ring</span><span class="chip g-app">protocol</span><span class="chip g-app">common</span></div><div class="bin-note">Binary src/app/video_sender. Links libvideo.a and libutil.a, plus libvpx, SDL2 and FFmpeg.</div></div>
+<div class="bin-row"><div class="bin-name"><code>video_receiver</code></div><div class="bin-chips"><span class="chip g-app">video_receiver</span><span class="chip g-app">decoder</span><span class="chip g-app">protocol</span><span class="chip g-app">common</span></div><div class="bin-note">Binary src/app/video_receiver. Links libvideo.a and libutil.a, plus libvpx and SDL2.</div></div>
+<div class="bin-row"><div class="bin-name"><code>webcam</code></div><div class="bin-chips"><span class="chip g-video">webcam</span></div><div class="bin-note">Binary src/video/webcam: a camera viewer.</div></div>
+<div class="bin-row"><div class="bin-name"><code>capture_to_disk</code></div><div class="bin-chips"><span class="chip g-tools">capture_to_disk</span></div><div class="bin-note">Standalone tool, built separately (see the comment at the top of tools/capture_to_disk.c).</div></div>
+    </div>
+
+    <h3>Suggested reading order</h3>
+    <ol class="steps">
+      <li><code>src/app/protocol.hh</code>: the messages on the wire.</li>
+      <li><code>video_sender.cc</code> with <code>capture.cc</code>, <code>frame_ring.cc</code> and <code>encoder.cc</code>.</li>
+      <li><code>video_receiver.cc</code> with <code>decoder.cc</code>.</li>
+      <li><code>src/util</code> and <code>src/video</code>: the plumbing underneath.</li>
+    </ol>
+
+    <details class="mod-details">
+      <summary>All modules, with what they include</summary>
+      <div class="table-wrap">
+        <table class="mod-table">
+          <thead><tr><th>Module</th><th>Files</th><th>What it is</th><th>Includes</th><th>External</th></tr></thead>
+          <tbody>
+<tr><td><code>app/video_sender</code></td><td><code>video_sender.cc</code></td><td>Sender main: option parsing, handshake, and the event loop (frame timer, socket readable/writable, stats timer).</td><td><code>app/capture</code>, <code>app/common</code>, <code>app/encoder</code>, <code>app/frame_ring</code>, <code>app/protocol</code>, <code>util/conversion</code>, <code>util/poller</code>, <code>util/timerfd</code>, <code>util/timestamp</code>, <code>util/udp_socket</code></td><td>&mdash;</td></tr>
+<tr><td><code>app/capture</code></td><td><code>capture.cc</code>, <code>capture.hh</code></td><td>Camera capture thread (V4L2 mmap streaming), YUYV to I420 conversion with libswscale, and the preview window.</td><td><code>app/common</code>, <code>app/frame_ring</code>, <code>util/exception</code></td><td>FFmpeg, SDL2, V4L2 (kernel)</td></tr>
+<tr><td><code>app/frame_ring</code></td><td><code>frame_ring.cc</code>, <code>frame_ring.hh</code></td><td>Ring of preallocated raw I420 frame slots between the capture thread and the encoder; drops the new frame when full.</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>app/encoder</code></td><td><code>encoder.cc</code>, <code>encoder.hh</code></td><td>VP9 encoder (libvpx), packetization, unacked tracking, RTT, retransmission and key-frame recovery.</td><td><code>app/protocol</code>, <code>util/conversion</code>, <code>util/exception</code>, <code>util/file_descriptor</code>, <code>util/timestamp</code>, <code>video/image</code></td><td>libvpx</td></tr>
+<tr><td><code>app/protocol</code></td><td><code>protocol.cc</code>, <code>protocol.hh</code></td><td>Wire format: Datagram, AckMsg and ConfigMsg, all integers big-endian.</td><td><code>util/serialization</code></td><td>&mdash;</td></tr>
+<tr><td><code>app/common</code></td><td><code>common.cc</code>, <code>common.hh</code></td><td>Stop-signal handling and the handshake helper shared by sender and receiver.</td><td><code>app/protocol</code>, <code>util/address</code>, <code>util/exception</code>, <code>util/udp_socket</code></td><td>&mdash;</td></tr>
+<tr><td><code>app/video_receiver</code></td><td><code>video_receiver.cc</code></td><td>Receiver main: option parsing, handshake, and the receive/ACK loop.</td><td><code>app/common</code>, <code>app/decoder</code>, <code>app/protocol</code>, <code>util/conversion</code>, <code>util/poller</code>, <code>util/udp_socket</code></td><td>&mdash;</td></tr>
+<tr><td><code>app/decoder</code></td><td><code>decoder.cc</code>, <code>decoder.hh</code></td><td>Frame reassembly, skip-ahead recovery, goodput measurement, and the decode/record/display worker.</td><td><code>app/common</code>, <code>app/protocol</code>, <code>util/conversion</code>, <code>util/exception</code>, <code>util/file_descriptor</code>, <code>util/timestamp</code>, <code>video/image</code>, <code>video/sdl</code></td><td>libvpx</td></tr>
+<tr><td><code>tools/capture_to_disk</code></td><td><code>capture_to_disk.c</code></td><td>Standalone recorder: camera to .y4m with preview, no encoding and no network. Built separately.</td><td>&mdash;</td><td>FFmpeg, SDL2, V4L2 (kernel)</td></tr>
+<tr><td><code>video/webcam</code></td><td><code>webcam.cc</code></td><td>webcam viewer: shows a V4L2 camera in an SDL window.</td><td><code>util/conversion</code>, <code>util/poller</code>, <code>video/image</code>, <code>video/sdl</code>, <code>video/v4l2</code></td><td>&mdash;</td></tr>
+<tr><td><code>video/v4l2</code></td><td><code>v4l2.cc</code>, <code>v4l2.hh</code></td><td>V4L2 camera class with memory-mapped buffers, used by the webcam viewer.</td><td><code>util/exception</code>, <code>util/file_descriptor</code>, <code>util/mmap</code>, <code>video/video_input</code></td><td>V4L2 (kernel)</td></tr>
+<tr><td><code>video/yuv4mpeg</code></td><td><code>yuv4mpeg.cc</code>, <code>yuv4mpeg.hh</code></td><td>Reader for Y4M (YUV4MPEG2) files.</td><td><code>util/conversion</code>, <code>util/exception</code>, <code>util/file_descriptor</code>, <code>util/split</code>, <code>video/video_input</code></td><td>&mdash;</td></tr>
+<tr><td><code>video/video_input</code></td><td><code>video_input.hh</code></td><td>Interface for sources of raw frames, implemented by the V4L2 and Y4M readers.</td><td><code>video/image</code></td><td>&mdash;</td></tr>
+<tr><td><code>video/sdl</code></td><td><code>sdl.cc</code>, <code>sdl.hh</code></td><td>SDL window that displays frames.</td><td><code>video/image</code></td><td>SDL2</td></tr>
+<tr><td><code>video/image</code></td><td><code>image.cc</code>, <code>image.hh</code></td><td>RawImage: a wrapper around a libvpx vpx_image in I420 format.</td><td>&mdash;</td><td>libvpx</td></tr>
+<tr><td><code>util/timerfd</code></td><td><code>timerfd.cc</code>, <code>timerfd.hh</code></td><td>Timer file descriptor (timerfd); the sender&#x27;s event loop uses it for its timers.</td><td><code>util/conversion</code>, <code>util/exception</code>, <code>util/file_descriptor</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/timestamp</code></td><td><code>timestamp.cc</code>, <code>timestamp.hh</code></td><td>Current time in nanoseconds, microseconds or milliseconds.</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>util/conversion</code></td><td><code>conversion.cc</code>, <code>conversion.hh</code></td><td>Safe conversions between strings and numbers and between integer types (used for option parsing).</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>util/poller</code></td><td><code>poller.cc</code>, <code>poller.hh</code></td><td>Event loop on poll(2): callbacks for readable/writable file descriptors. Used by the apps.</td><td><code>util/exception</code>, <code>util/file_descriptor</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/epoller</code></td><td><code>epoller.cc</code>, <code>epoller.hh</code></td><td>Event loop on epoll(7) with the same interface as Poller. Currently unused by the apps.</td><td><code>util/exception</code>, <code>util/file_descriptor</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/file_descriptor</code></td><td><code>file_descriptor.cc</code>, <code>file_descriptor.hh</code></td><td>FileDescriptor: RAII owner of a Unix file descriptor, with read/write helpers.</td><td><code>util/exception</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/exception</code></td><td><code>exception.hh</code></td><td>Helpers that turn C-style error returns into C++ exceptions. Used almost everywhere.</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>util/mmap</code></td><td><code>mmap.cc</code>, <code>mmap.hh</code></td><td>MMap: RAII owner of a memory mapping (mmap/munmap). Used by the V4L2 class.</td><td><code>util/exception</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/serialization</code></td><td><code>serialization.cc</code>, <code>serialization.hh</code></td><td>Big-endian serialization: values to and from network byte order.</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>util/address</code></td><td><code>address.cc</code>, <code>address.hh</code></td><td>Address: an IPv4 socket address (IP and port), a value wrapper around sockaddr.</td><td>&mdash;</td><td>&mdash;</td></tr>
+<tr><td><code>util/socket</code></td><td><code>socket.cc</code>, <code>socket.hh</code></td><td>Base socket class: socket options, bind and connect.</td><td><code>util/address</code>, <code>util/exception</code>, <code>util/file_descriptor</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/udp_socket</code></td><td><code>udp_socket.cc</code>, <code>udp_socket.hh</code></td><td>UDP socket: send and receive datagrams, including non-blocking mode.</td><td><code>util/address</code>, <code>util/exception</code>, <code>util/socket</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/tcp_socket</code></td><td><code>tcp_socket.cc</code>, <code>tcp_socket.hh</code></td><td>TCP socket: listen and accept. Not included by the apps.</td><td><code>util/exception</code>, <code>util/socket</code></td><td>&mdash;</td></tr>
+<tr><td><code>util/split</code></td><td><code>split.cc</code>, <code>split.hh</code></td><td>String splitting helper, used by the Y4M reader.</td><td>&mdash;</td><td>&mdash;</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
+
+    <h3>Other folders</h3>
+    <ul class="plain">
+      <li><code>tests/</code>: unit tests that need only a C++17 compiler.</li>
+      <li><code>docs/</code>: this website (GitHub Pages).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================= GOAL ======================= -->
+<section id="goal" class="alt">
+  <div class="wrap">
+    <h2>Goal</h2>
+    <p class="lead">What the finished system should do. This describes the target behaviour, not how to build it; working that out is the job of the roadmap.</p>
+
+    <div class="grid">
+      <div class="card"><div class="num">GOAL 1</div><h4>Capture continuously</h4><p>Some CPU cores pick frames up from the camera into a ring buffer, which is written, read and freed continuously.</p></div>
+      <div class="card"><div class="num">GOAL 2</div><h4>Encode on the GPU</h4><p>The Jetson boards this targets have no hardware video encoder (NVENC), so compression work has to run on the GPU (CUDA) rather than on dedicated encoder hardware.</p></div>
+      <div class="card"><div class="num">GOAL 3</div><h4>Package and transmit</h4><p>Encoded frames are packaged and transmitted on other CPU cores.</p></div>
+      <div class="card"><div class="num">GOAL 4</div><h4>Stagger the stages</h4><p>The stages overlap: while the GPU encodes frame N, the capture cores already grab frame N+1 and the transmit cores send frame N&minus;1.</p></div>
+      <div class="card"><div class="num">GOAL 5</div><h4>Share the server fairly</h4><p>Many devices stream to one storage server and compete for its bandwidth. Congestion has to be measured and reported between server and devices.</p></div>
+      <div class="card"><div class="num">GOAL 6</div><h4>Adapt</h4><p>Each device adjusts everything that can be adjusted to fit what the network and server can take, while losing as little useful data as possible.</p></div>
+    </div>
+
+    <h3>Overlapping stages on one device</h3>
+    <figure>
+      <svg class="dg" viewBox="0 0 960 220" role="img" aria-labelledby="stag-t">
+        <title id="stag-t">Target behaviour: in the same frame interval the capture cores grab frame N+1, the GPU encodes frame N and the transmit cores send frame N-1.</title>
+        <g>
+          <line class="grid-line" x1="200" y1="10" x2="200" y2="190"/><line class="grid-line" x1="325" y1="10" x2="325" y2="190"/>
+          <line class="grid-line" x1="450" y1="10" x2="450" y2="190"/><line class="grid-line" x1="575" y1="10" x2="575" y2="190"/>
+          <line class="grid-line" x1="700" y1="10" x2="700" y2="190"/><line class="grid-line" x1="825" y1="10" x2="825" y2="190"/>
+          <line class="grid-line" x1="950" y1="10" x2="950" y2="190"/>
+        </g>
+        <rect x="575" y="12" width="125" height="178" rx="4" class="line-accent dash" fill="none"/>
+        <text class="title" x="10" y="48">Capture</text><text class="small" x="10" y="64">CPU cores</text>
+        <text class="title" x="10" y="108">Encode</text><text class="small" x="10" y="124">GPU</text>
+        <text class="title" x="10" y="168">Transmit</text><text class="small" x="10" y="184">other CPU cores</text>
+
+        <rect class="cap" x="206" y="30" width="113" height="40" rx="6"/><text class="mono center" x="262" y="55">N&minus;2</text>
+        <rect class="cap" x="331" y="30" width="113" height="40" rx="6"/><text class="mono center" x="387" y="55">N&minus;1</text>
+        <rect class="cap" x="456" y="30" width="113" height="40" rx="6"/><text class="mono center" x="512" y="55">N</text>
+        <rect class="cap" x="581" y="30" width="113" height="40" rx="6"/><text class="mono center" x="637" y="55">N+1</text>
+        <rect class="cap" x="706" y="30" width="113" height="40" rx="6"/><text class="mono center" x="762" y="55">N+2</text>
+        <rect class="cap" x="831" y="30" width="113" height="40" rx="6"/><text class="mono center" x="887" y="55">N+3</text>
+
+        <rect class="enc" x="331" y="90" width="113" height="40" rx="6"/><text class="mono center" x="387" y="115">N&minus;2</text>
+        <rect class="enc" x="456" y="90" width="113" height="40" rx="6"/><text class="mono center" x="512" y="115">N&minus;1</text>
+        <rect class="enc" x="581" y="90" width="113" height="40" rx="6"/><text class="mono center" x="637" y="115">N</text>
+        <rect class="enc" x="706" y="90" width="113" height="40" rx="6"/><text class="mono center" x="762" y="115">N+1</text>
+        <rect class="enc" x="831" y="90" width="113" height="40" rx="6"/><text class="mono center" x="887" y="115">N+2</text>
+
+        <rect class="tx" x="456" y="150" width="113" height="40" rx="6"/><text class="mono center" x="512" y="175">N&minus;2</text>
+        <rect class="tx" x="581" y="150" width="113" height="40" rx="6"/><text class="mono center" x="637" y="175">N&minus;1</text>
+        <rect class="tx" x="706" y="150" width="113" height="40" rx="6"/><text class="mono center" x="762" y="175">N</text>
+        <rect class="tx" x="831" y="150" width="113" height="40" rx="6"/><text class="mono center" x="887" y="175">N+1</text>
+        <text class="small" x="200" y="212">Each column is one frame interval. Highlighted: the GPU encodes N while N+1 is captured and N&minus;1 is sent.</text>
+      </svg>
+      <figcaption>Today all of encode and transmit happen on one thread, so nothing overlaps (see <a href="#how">How it works</a>).</figcaption>
+    </figure>
+
+    <h3>Many devices, one server</h3>
+    <figure>
+      <svg class="dg" viewBox="0 0 960 300" role="img" aria-labelledby="fleet-t">
+        <title id="fleet-t">Target behaviour: several edge devices stream video to one storage server; congestion is measured and reported between the server and each device, and each device adapts.</title>
+        <defs>
+          <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrowhead-2" d="M0,0 L10,5 L0,10 z"/></marker>
+          <marker id="fb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="arrowhead-3" d="M0,0 L10,5 L0,10 z"/></marker>
+        </defs>
+        <rect class="box" x="10" y="20" width="260" height="70" rx="10"/><text class="title" x="28" y="50">Edge device</text><text class="small" x="28" y="70">capture &middot; GPU encode &middot; transmit</text>
+        <rect class="box" x="10" y="115" width="260" height="70" rx="10"/><text class="title" x="28" y="145">Edge device</text><text class="small" x="28" y="165">capture &middot; GPU encode &middot; transmit</text>
+        <rect class="box" x="10" y="210" width="260" height="70" rx="10"/><text class="title" x="28" y="240">Edge device</text><text class="small" x="28" y="260">capture &middot; GPU encode &middot; transmit</text>
+
+        <rect class="box-alt" x="400" y="110" width="140" height="80" rx="10"/><text class="title center" x="470" y="146">Shared</text><text class="title center" x="470" y="164">bandwidth</text>
+
+        <rect class="box" x="680" y="60" width="270" height="180" rx="10"/>
+        <text class="title" x="698" y="90">Storage server</text>
+        <text class="small" x="698" y="112">receives from all devices at once</text>
+        <rect class="cap" x="698" y="128" width="234" height="34" rx="6"/><text x="710" y="150">records each stream</text>
+        <rect class="tx" x="698" y="172" width="234" height="48" rx="6"/><text x="710" y="192">measures congestion</text><text class="small" x="710" y="210">and reports it to each device</text>
+
+        <path class="line-2" d="M270,50 C340,50 350,135 398,138" marker-end="url(#fa)"/>
+        <path class="line-2" d="M270,150 L398,150" marker-end="url(#fa)"/>
+        <path class="line-2" d="M270,245 C340,245 350,165 398,162" marker-end="url(#fa)"/>
+        <path class="line-2" d="M540,150 L678,150" marker-end="url(#fa)"/>
+        <path class="line-3 dash" d="M678,205 C600,205 600,285 280,280" marker-end="url(#fb)"/>
+        <text class="small" x="292" y="105">video</text>
+        <text class="small" x="430" y="270">congestion reports (both ways)</text>
+      </svg>
+      <figcaption>What happens, not how: the measurement, the report contents and the fairness policy are roadmap items 5 and 6.</figcaption>
+    </figure>
+
+    <h3>What a device can adjust</h3>
+    <div class="knobs">
+      <span class="knob">bitrate</span>
+      <span class="knob">frame rate</span>
+      <span class="knob">resolution</span>
+      <span class="knob">dropping frames</span>
+    </div>
+    <p>Each device should back off under congestion and recover afterwards, while losing as little useful data as possible. When and how to use each knob is part of roadmap item 5.</p>
+  </div>
+</section>
+
+<!-- ======================= STATUS ======================= -->
+<section id="status">
+  <div class="wrap">
+    <h2>Status</h2>
+    <p class="lead">What the current code does, and what is still to be built. Nothing has been validated on Jetson hardware yet.</p>
+
+    <div class="counters two">
+      <div class="counter done"><div class="n">11</div><div class="lbl">Done</div></div>
+      <div class="counter plan"><div class="n">9</div><div class="lbl">Planned (roadmap items)</div></div>
+    </div>
+    <div class="progress" role="img" aria-label="11 of 20 items done, 9 planned">
+      <div class="p-done" style="width:55%"></div>
+      <div class="p-plan" style="width:45%"></div>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <h4>Done</h4>
+        <ul class="checklist">
+          <li class="done"><span class="mark"></span><span>Camera capture thread (V4L2, mmap), YUYV&rarr;I420 with libswscale, preview window</span></li>
+          <li class="done"><span class="mark"></span><span>VP9 encoding on the CPU (libvpx, real-time CBR, key frames on demand)</span></li>
+          <li class="done"><span class="mark"></span><span>Packetization into MTU-sized datagrams</span></li>
+          <li class="done"><span class="mark"></span><span>Per-datagram ACKs, RTT (min / EWMA), retransmission (up to 3 times), key-frame recovery after 1 s</span></li>
+          <li class="done"><span class="mark"></span><span>Goodput measured by the receiver and piggy-backed on ACKs (logged only)</span></li>
+          <li class="done"><span class="mark"></span><span>Frame reassembly with skip-ahead to a key frame</span></li>
+          <li class="done"><span class="mark"></span><span>Decode, <code>.y4m</code> recording and display on the receiver</span></li>
+          <li class="done"><span class="mark"></span><span>Robust handshake: retries, and malformed or stray packets no longer crash either side</span></li>
+          <li class="done"><span class="mark"></span><span>Clean Ctrl+C shutdown on both sides, with the recording finished and closed</span></li>
+          <li class="done"><span class="mark"></span><span>Upstream bug fixes (see <a href="#history">History</a>)</span></li>
+          <li class="done"><span class="mark"></span><span>Unit tests: wire protocol, frame ring, handshake over loopback</span></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h4>Planned</h4>
+        <ul class="checklist">
+          <li class="planned"><span class="mark"></span><span><a href="#r1">1. Per-stage latency benchmarking</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r2">2. Staged pipeline and latency hiding</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r3">3. A better ring buffer</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r4">4. GPU offload on Jetson (no NVENC)</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r5">5. Congestion feedback and adaptation</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r6">6. Multi-device storage server</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r7">7. Storage without decoding</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r8">8. Building parts in Rust</a></span></li>
+          <li class="planned"><span class="mark"></span><span><a href="#r9">9. Hardening and operations</a></span></li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>Known limitations</h3>
+    <p>These are the starting points for the roadmap.</p>
+    <ul class="plain">
+      <li><strong>One thread for encoding and sending.</strong> The sender encodes and does all network I/O on the same thread, so a slow encode delays ACK processing and sending, and nothing overlaps.</li>
+      <li><strong>CPU-only encoding.</strong> Encoding runs on the CPU through libvpx.</li>
+      <li><strong>The ring uses a mutex and is FIFO.</strong> If the encoder is slower than the camera, frames queue up and age, so latency grows until the ring fills.</li>
+      <li><strong>Bitrate, fps and resolution are fixed.</strong> The goodput feedback is only logged.</li>
+      <li><strong>One device per receiver process.</strong></li>
+      <li><strong>No per-stage latency measurement.</strong> There are only coarse per-frame logs (<code>-o</code>).</li>
+      <li><strong>No reorder tolerance.</strong> Any datagram older than one that was acked is treated as lost.</li>
+      <li><strong>The receiver display uses vsync.</strong> With <code>--lazy 0</code> at fps above the monitor's refresh rate, use <code>--lazy 1</code> for recording.</li>
+      <li><strong>Not yet validated on Jetson hardware.</strong></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================= ROADMAP ======================= -->
+<section id="roadmap" class="alt">
+  <div class="wrap">
+    <h2>Roadmap</h2>
+    <p class="lead">Each item says what to build, why, how we know it is done, and what to read up on. Items roughly build on each other, but several can proceed in parallel. Measure before and after every change; item 1 gives you the tools for that.</p>
+
+    <ol class="roadmap">
+      <li id="r1" class="rm">
+        <h3><span class="rm-n">1</span>Per-stage latency benchmarking</h3>
+        <dl>
+          <dt>Goal</dt><dd>Know where the time goes. Timestamp every frame at each stage on both machines: capture, ring wait, conversion, encode, send queue, transmit, network, reassembly, decode and write. Report per-stage and end-to-end latency distributions.</dd>
+          <dt>Done when</dt><dd>One command turns a sender log and a server log into a per-stage table of p50, p95 and p99, and end-to-end latency is reported correctly when the two machines' clocks are synchronized.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span><code>clock_gettime</code> (<code>CLOCK_MONOTONIC</code> vs <code>CLOCK_REALTIME</code>)</span><span>chrony and PTP clock synchronization</span><span>percentiles vs averages</span><span>tail latency</span></dd>
+        </dl>
+      </li>
+      <li id="r2" class="rm">
+        <h3><span class="rm-n">2</span>Staged pipeline and latency hiding</h3>
+        <dl>
+          <dt>Goal</dt><dd>Split the sender into separate capture, encode and packetize/transmit stages on separate threads and cores, so the stages overlap. Then use the measurements from item 1 to find the slowest stage and break it up further, so more of the work hides behind other work.</dd>
+          <dt>Done when</dt><dd>Sustained throughput is limited by the slowest stage rather than the sum of all stages, the event loop never blocks on encoding, and the per-stage numbers show the overlap. The before/after comparison is documented.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>pipeline parallelism</span><span>Amdahl's law</span><span><code>pthread_setaffinity_np</code> and <code>isolcpus</code></span><span><code>eventfd</code></span><span>VP9 tiles and row multi-threading</span><span>double-buffering</span><span>packet pacing</span></dd>
+        </dl>
+      </li>
+      <li id="r3" class="rm">
+        <h3><span class="rm-n">3</span>A better ring buffer</h3>
+        <dl>
+          <dt>Goal</dt><dd>A ring between capture and encode that never blocks either side, keeps latency bounded when the consumer falls behind, and avoids extra copies of frame data.</dd>
+          <dt>Done when</dt><dd>A stress test with two threads passes, latency stays bounded when the encoder is artificially slowed, and the ring's overhead is measured.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>single-producer/single-consumer queues</span><span><code>std::atomic</code> memory ordering (acquire/release)</span><span>false sharing and cache-line alignment</span><span>drop policies (drop newest vs drop oldest)</span></dd>
+        </dl>
+      </li>
+      <li id="r4" class="rm">
+        <h3><span class="rm-n">4</span>GPU offload on Jetson (no NVENC)</h3>
+        <dl>
+          <dt>Goal</dt><dd>Move per-frame pixel work (colour conversion, scaling) onto the GPU first, then the compression work itself, so the CPU cores are free for capture and networking.</dd>
+          <dt>Done when</dt><dd>GPU output matches a CPU reference (bit-exact for conversion), the encode stage keeps up at the target modes on a Jetson, and CPU load drops measurably.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>CUDA streams and asynchronous copies</span><span>pinned and unified memory on Jetson</span><span>NVIDIA NPP and VPI</span><span>nvJPEG</span><span>which Jetson modules lack NVENC</span><span>motion estimation on GPUs</span></dd>
+        </dl>
+      </li>
+      <li id="r5" class="rm">
+        <h3><span class="rm-n">5</span>Congestion feedback and adaptation</h3>
+        <dl>
+          <dt>Goal</dt><dd>The server measures what it receives (goodput, frame loss, queuing delay) and reports it to the device. The device reports its own state to the server. The device then adapts bitrate, frame rate and resolution, and drops frames when needed, so it backs off under congestion and recovers afterwards.</dd>
+          <dt>Done when</dt><dd>Under emulated congestion (<code>tc netem</code>, bandwidth limits) the stream adapts within a bounded time without oscillating, and recordings stay decodable. The receiver starts a new recording file when the resolution changes.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>AIMD</span><span>Google Congestion Control (GCC)</span><span>RFC 8698 (NADA)</span><span>RFC 8888 (RTP congestion-control feedback)</span><span>libvpx <code>vpx_codec_enc_config_set</code></span><span>spatial and temporal scalability (SVC)</span></dd>
+        </dl>
+      </li>
+      <li id="r6" class="rm">
+        <h3><span class="rm-n">6</span>Multi-device storage server</h3>
+        <dl>
+          <dt>Goal</dt><dd>One server process that receives from many devices at once and shares its bandwidth fairly among them, telling each device its budget.</dd>
+          <dt>Done when</dt><dd>Several senders stream to one server at the same time, each is recorded separately, and the bandwidth split follows the chosen fairness policy as devices join and leave.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>max-min fairness</span><span><code>epoll</code></span><span>per-connection session state</span><span>device identity and registration</span></dd>
+        </dl>
+      </li>
+      <li id="r7" class="rm">
+        <h3><span class="rm-n">7</span>Storage without decoding</h3>
+        <dl>
+          <dt>Goal</dt><dd>Let the server store the compressed stream directly, with decoding optional, so it can serve many devices cheaply.</dd>
+          <dt>Done when</dt><dd>Recordings play back in standard players and contain timestamps.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>the IVF container</span><span>WebM/Matroska (libwebm)</span></dd>
+        </dl>
+      </li>
+      <li id="r8" class="rm">
+        <h3><span class="rm-n">8</span>Building parts in Rust</h3>
+        <dl>
+          <dt>Goal</dt><dd>Move the components that benefit most from memory safety and safe concurrency to Rust, while keeping V4L2, CUDA and libvpx code in C/C++. Candidates: parsing of untrusted network input (the wire protocol), the storage server, the congestion and fairness logic, and queues shared between threads.</dd>
+          <dt>Done when</dt><dd>A Rust crate builds with <code>cargo</code>, links into the existing binaries through a C ABI (or the server is a Rust binary speaking the same wire format), and has parity tests that check it against the C++ implementation.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span><code>extern "C"</code> and <code>#[no_mangle]</code></span><span><code>cbindgen</code></span><span>the <code>cxx</code> crate</span><span><code>bindgen</code> and the <code>cc</code> crate in <code>build.rs</code></span><span>the <code>staticlib</code> crate type</span><span>fuzzing with <code>cargo fuzz</code></span><span><code>tokio</code> for the server</span></dd>
+        </dl>
+      </li>
+      <li id="r9" class="rm">
+        <h3><span class="rm-n">9</span>Hardening and operations</h3>
+        <dl>
+          <dt>Goal</dt><dd>Run reliably for long periods on real devices.</dd>
+          <dt>Done when</dt><dd>A long soak test on a Jetson passes, metrics are exported, and the transport is encrypted and authenticated.</dd>
+          <dt>Pointers</dt><dd class="pointers"><span>DTLS or QUIC</span><span>Prometheus exporters</span><span>CI with GitHub Actions</span><span>sanitizers (ASan, TSan, UBSan)</span></dd>
+        </dl>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<!-- ======================= RUST ======================= -->
+<section id="rust">
+  <div class="wrap">
+    <h2>Building parts in Rust</h2>
+    <p class="lead">Roadmap item 8. The goal is not a rewrite: move the parts that gain the most from Rust's guarantees, and leave the hardware-facing code where it is. How to split the work and design the interfaces is up to you.</p>
+
+    <div class="two-col">
+      <div class="card">
+        <h4>Candidates for Rust, and why</h4>
+        <ul class="plain">
+          <li><strong>Parsing of untrusted network input (the wire protocol).</strong> Anything on the network can send a malformed packet; memory safety means such input cannot corrupt memory.</li>
+          <li><strong>The storage server.</strong> It handles many connections at once, where safe concurrency helps.</li>
+          <li><strong>The congestion and fairness logic.</strong> Self-contained decision logic that is easy to test in isolation.</li>
+          <li><strong>Queues shared between threads.</strong> Concurrency bugs here are hard to find; the compiler checks how data is shared.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h4>Stays in C/C++</h4>
+        <ul class="plain">
+          <li>V4L2 camera code</li>
+          <li>CUDA code</li>
+          <li>libvpx code</li>
+        </ul>
+        <h4 style="margin-top:16px">Done when</h4>
+        <p>A Rust crate builds with <code>cargo</code>, links into the existing binaries through a C ABI (or the server is a Rust binary speaking the same wire format), and has parity tests that check it against the C++ implementation.</p>
+      </div>
+    </div>
+
+    <h3>What to read up on</h3>
+    <div class="pointers big">
+      <span><code>extern "C"</code> and <code>#[no_mangle]</code></span>
+      <span><code>cbindgen</code></span>
+      <span>the <code>cxx</code> crate</span>
+      <span><code>bindgen</code> and the <code>cc</code> crate in <code>build.rs</code></span>
+      <span>the <code>staticlib</code> crate type</span>
+      <span>fuzzing with <code>cargo fuzz</code></span>
+      <span><code>tokio</code> for the server</span>
+    </div>
+    <p>Install Rust with <a href="https://rustup.rs">rustup</a>.</p>
+  </div>
+</section>
+
+<!-- ======================= SETUP ======================= -->
+<section id="setup" class="alt">
+  <div class="wrap">
+    <h2>Setup &amp; testing</h2>
+    <p class="lead">Ubuntu 22.04 or later, or JetPack on a Jetson.</p>
+
+    <h3>Dependencies</h3>
+    <div class="code"><div class="label">shell</div><pre><code>sudo apt install build-essential autoconf automake pkg-config \
+     libvpx-dev libsdl2-dev libavutil-dev libswscale-dev</code></pre></div>
+    <ul class="plain">
+      <li><strong>No camera?</strong> Use a virtual V4L2 camera (<code>v4l2loopback</code>) fed by FFmpeg; see below.</li>
+      <li><strong>For roadmap work:</strong> the CUDA toolkit (part of JetPack on Jetson; on a PC from NVIDIA's site), and Rust via <a href="https://rustup.rs">rustup</a> for the Rust items.</li>
+      <li><strong>For viewing recordings:</strong> <code>sudo apt install ffmpeg</code>.</li>
+    </ul>
+
+    <h3>Build</h3>
+    <div class="code"><div class="label">shell</div><pre><code>./autogen.sh
+./configure
+make -j</code></pre></div>
+    <p>This produces <code>src/app/video_sender</code>, <code>src/app/video_receiver</code> and <code>src/video/webcam</code>. The standalone recorder is built separately; see the comment at the top of <code>tools/capture_to_disk.c</code>. The code is compiled with <code>-Wall -Wextra -Werror -Weffc++</code>, so warnings fail the build.</p>
+
+    <h3>Unit tests</h3>
+    <p>These need no camera and no media libraries.</p>
+    <div class="code"><div class="label">shell</div><pre><code>make -C tests run</code></pre></div>
+    <p>They cover the wire protocol (round trips, truncated and random input), the frame ring (ordering under two threads, drop-when-full) and the handshake over loopback (including a receiver that starts before the sender). Add a test for every module you change.</p>
+
+    <h3>End to end on one machine with a virtual camera</h3>
+    <div class="code"><div class="label">install the virtual camera module</div><pre><code>sudo apt install v4l2loopback-dkms</code></pre></div>
+    <div class="code"><div class="label">create the virtual camera</div><pre><code>sudo modprobe v4l2loopback devices=1 video_nr=10 exclusive_caps=1</code></pre></div>
+    <div class="code"><div class="label">feed it a test pattern</div><pre><code>ffmpeg -re -f lavfi -i testsrc2=size=1280x720:rate=60 -pix_fmt yuyv422 -f v4l2 /dev/video10</code></pre></div>
+    <p>Then, in two other terminals:</p>
+    <div class="code"><div class="label">sender</div><pre><code>./src/app/video_sender 9000 -w 1280 -h 720 -r 60 -d /dev/video10 --no-preview</code></pre></div>
+    <div class="code"><div class="label">receiver</div><pre><code>./src/app/video_receiver 127.0.0.1 9000 --cbr 6000 --lazy 1</code></pre></div>
+    <p>Stop both with Ctrl+C. Check that a <code>.y4m</code> file appeared in <code>data/</code> and that it plays (see <a href="#viewing">Viewing a recording</a>).</p>
+
+    <h3>Network conditions</h3>
+    <p>To see loss recovery, add loss or delay on the loopback interface with <code>tc netem</code>, and remove it when done:</p>
+    <div class="code"><div class="label">add loss and delay</div><pre><code>sudo tc qdisc add dev lo root netem loss 2% delay 20ms</code></pre></div>
+    <div class="code"><div class="label">remove it</div><pre><code>sudo tc qdisc del dev lo root</code></pre></div>
+    <p><strong>On a Jetson,</strong> use the real camera (<code>/dev/video0</code>) and run the receiver on another machine on the same network.</p>
+
+    <h3>Running</h3>
+    <p>Start the sender first, on the camera machine:</p>
+    <div class="code"><div class="label">sender</div><pre><code>./src/app/video_sender &lt;port&gt; -w &lt;width&gt; -h &lt;height&gt; -r &lt;fps&gt; [options]</code></pre></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>-w</code>, <code>-h</code>, <code>-r</code></td><td>capture width, height, fps (required; see the modes below)</td></tr>
+          <tr><td><code>-d &lt;path&gt;</code></td><td>camera device (default <code>/dev/video0</code>)</td></tr>
+          <tr><td><code>--mtu &lt;bytes&gt;</code></td><td>MTU for sizing datagrams (512&ndash;1500, default 1500)</td></tr>
+          <tr><td><code>--no-preview</code></td><td>do not open the preview window (for headless boards)</td></tr>
+          <tr><td><code>-o &lt;file&gt;</code></td><td>per-frame CSV: <code>frame_id,target_kbps,size_bytes,encode_start_us,encode_end_us</code></td></tr>
+          <tr><td><code>-v</code></td><td>log every datagram and ACK</td></tr>
+          <tr><td><code>--help</code></td><td>usage (note that <code>-h</code> means height)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Then start the receiver on the server:</p>
+    <div class="code"><div class="label">receiver</div><pre><code>./src/app/video_receiver &lt;sender ip&gt; &lt;port&gt; --cbr &lt;kbps&gt; [options]</code></pre></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>--cbr &lt;kbps&gt;</code></td><td>target bitrate to ask the sender for (required)</td></tr>
+          <tr><td><code>--lazy 0</code></td><td>decode, record and display (default)</td></tr>
+          <tr><td><code>--lazy 1</code></td><td>decode and record, no window (recommended on servers)</td></tr>
+          <tr><td><code>--lazy 2</code></td><td>only reassemble frames; nothing is decoded or recorded</td></tr>
+          <tr><td><code>--record-dir &lt;dir&gt;</code></td><td>where the <code>.y4m</code> is written (default <code>./data</code>, created if missing)</td></tr>
+          <tr><td><code>-o &lt;file&gt;</code></td><td>per-frame CSV: <code>frame_id,size_bytes,decoded_us</code></td></tr>
+          <tr><td><code>-v</code></td><td>log every datagram</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="two-col">
+      <div>
+        <h3>Supported modes (sender)</h3>
+        <p>Limited by the camera / V4L2. The frame rate must be one of {120, 60, 50, 20, 14, 3} and must not exceed the limit for the resolution.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Width</th><th>Height</th><th>FPS</th><th>Remark</th></tr></thead>
+            <tbody>
+              <tr><td>1280</td><td>720</td><td>&le; 120</td><td>720p</td></tr>
+              <tr><td>1920</td><td>1080</td><td>&le; 60</td><td>1080p</td></tr>
+              <tr><td>2000</td><td>1500</td><td>&le; 50</td><td>2K</td></tr>
+              <tr><td>3840</td><td>2160</td><td>&le; 20</td><td>4K</td></tr>
+              <tr><td>4000</td><td>3000</td><td>&le; 14</td><td>4:3 4K</td></tr>
+              <tr><td>8000</td><td>6000</td><td>&le; 3</td><td>8K</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <h3>Practical bitrate ranges (<code>--cbr</code>)</h3>
+        <p>&nbsp;</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Width</th><th>Height</th><th>FPS</th><th>Bitrate range</th></tr></thead>
+            <tbody>
+              <tr><td>1280</td><td>720</td><td>60</td><td>4&ndash;8 Mbps</td></tr>
+              <tr><td>1280</td><td>720</td><td>120</td><td>6&ndash;12 Mbps</td></tr>
+              <tr><td>1920</td><td>1080</td><td>50</td><td>5&ndash;10 Mbps</td></tr>
+              <tr><td>1920</td><td>1080</td><td>60</td><td>6&ndash;12 Mbps</td></tr>
+              <tr><td>2000</td><td>1500</td><td>50</td><td>8&ndash;14 Mbps</td></tr>
+              <tr><td>3840</td><td>2160</td><td>20</td><td>12&ndash;24 Mbps</td></tr>
+              <tr><td>4000</td><td>3000</td><td>14</td><td>12&ndash;24 Mbps</td></tr>
+              <tr><td>8000</td><td>6000</td><td>3</td><td>20&ndash;40 Mbps</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <h3 id="viewing">Viewing a recording</h3>
+    <p>The <code>.y4m</code> files are uncompressed I420 (for example, 1080p60 is about 186 MB/s). To compress and play one:</p>
+    <div class="code"><div class="label">compress</div><pre><code>ffmpeg -i data/output_20250611_120000.y4m -c:v libx264 -preset fast -crf 23 output.mp4</code></pre></div>
+    <div class="code"><div class="label">play</div><pre><code>ffplay output.mp4</code></pre></div>
+  </div>
+</section>
+
+<!-- ======================= HISTORY ======================= -->
+<section id="history">
+  <div class="wrap">
+    <h2>History</h2>
+    <p class="lead">This project started as a copy of <a href="https://github.com/YuxinLiu2023/video_capture-stream_v2">YuxinLiu2023/video_capture-stream_v2</a>, which builds on Microsoft's <a href="https://github.com/microsoft/ringmaster">Ringmaster</a> (VP9 over UDP with per-datagram ACKs). The original commit history is kept in the repository. On top of it, the code was refactored, commented and fixed:</p>
+    <ul class="plain history">
+      <li><strong>Builds again.</strong> Upstream <code>encoder.cc</code> referenced an undeclared member, so it did not compile.</li>
+      <li><strong>Camera buffers.</strong> V4L2 used to keep only the last buffer mapping and read frames outside it. Every buffer is now mapped and looked up by index.</li>
+      <li><strong>Large frames.</strong> The fragment count was wrong for frames larger than about 2 MB, so the last datagram exceeded the MTU. Large key frames at 4K/8K are affected.</li>
+      <li><strong>Shutdown.</strong> Ctrl+C used to crash the sender. On the receiver it lost the buffered recording and never joined the decoder thread. Both programs now shut down cleanly.</li>
+      <li><strong>Display while recording.</strong> With <code>--lazy 0</code> the window used to stay empty: each decoded frame was used for the file and was then gone.</li>
+      <li><strong>Decode buffer.</strong> The fixed 1 MB buffer overflowed on large key frames.</li>
+      <li><strong>Handshake.</strong> It now retries, and malformed or stray packets no longer crash either side.</li>
+      <li><strong>Y4M output.</strong> Recordings now have square-pixel aspect, and the standalone recorder writes valid 4:2:2 Y4M.</li>
+      <li><strong>Repository.</strong> Generated build files were removed from git, a <code>.gitignore</code> was added, and unit tests were added.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>data-collect-system &middot; maintained by <a href="https://github.com/utkrshkmr">utkrshkmr</a></span>
+    <span>Builds on <a href="https://github.com/YuxinLiu2023/video_capture-stream_v2">video_capture-stream_v2</a> and <a href="https://github.com/microsoft/ringmaster">Ringmaster</a></span>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
