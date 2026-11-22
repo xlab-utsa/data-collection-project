@@ -34,3 +34,7 @@ src/app/data/
 
 # editor settings
 .vscode/
+
+# keep hand-written makefiles
+!tests/Makefile
+tests/build/
