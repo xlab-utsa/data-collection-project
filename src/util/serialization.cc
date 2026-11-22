@@ -1,7 +1,12 @@
+// Implementation of the non-template parts of serialization.hh.
+
 #include "serialization.hh"
 
 using namespace std;
 
+// These dereference the pointer directly, which assumes the platform allows
+// unaligned loads (true on x86-64 and 64-bit ARM). get_number() and
+// WireParser use memcpy and have no such assumption.
 uint8_t get_uint8(const char * data)
 {
   return *reinterpret_cast<const uint8_t *>(data);
@@ -28,6 +33,7 @@ string WireParser::read_string(const size_t len)
     throw out_of_range("WireParser::read_string(): attempted to read past end");
   }
 
+  // copies the bytes, so the returned string stays valid after the buffer
   string ret { str_.data(), len };
 
   // move the start of string view forward

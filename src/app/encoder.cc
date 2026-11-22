@@ -1,3 +1,12 @@
+// Implementation of Encoder (encoder.hh): libvpx VP9 encoding, splitting
+// encoded frames into Datagrams, and the sender's reliability logic
+// (unacked tracking, RTT estimation, retransmission, key-frame recovery).
+//
+// Call sequence from video_sender.cc, once per frame interval:
+//   compress_frame() -> encode_frame() + packetize_encoded_frame()
+//   (socket writable) send_buf() drained, add_unacked() per first send
+//   (ACK received)    handle_ack() -> RTT sample, maybe retransmissions
+
 #include <sys/sysinfo.h>
 #include <cassert>
 #include <iostream>
@@ -211,9 +220,12 @@ size_t Encoder::packetize_encoded_frame()
         }
       }
 
-      // total fragments to divide this frame into
+      // total fragments to divide this frame into: ceil(size / max_payload).
+      // (The upstream formula size / (max_payload + 1) + 1 undercounts for
+      // frames larger than about max_payload^2 bytes, ~2 MB, which made the
+      // last datagram exceed the MTU.)
       const uint16_t frag_cnt = narrow_cast<uint16_t>(
-          frame_size / (Datagram::max_payload + 1) + 1);
+          (frame_size + Datagram::max_payload - 1) / Datagram::max_payload);
 
       // next address to copy compressed frame data from
       uint8_t * buf_ptr = static_cast<uint8_t *>(encoder_pkt->data.frame.buf);

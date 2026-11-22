@@ -1,3 +1,6 @@
+// Implementation of the helpers in common.hh: stop-signal handling and the
+// handshake wait loop shared by video_sender and video_receiver.
+
 #include <poll.h>
 #include <signal.h>
 
@@ -33,6 +36,8 @@ void install_stop_signal_handlers()
   check_syscall(sigaction(SIGTERM, &sa, nullptr), "sigaction(SIGTERM)");
 }
 
+// poll() with a timeout (instead of a blocking recvfrom) lets the loop both
+// retry the request periodically and notice g_stop_requested.
 optional<pair<Address, ConfigMsg>>
 wait_for_config_msg(UDPSocket & sock,
                     const function<void()> & on_timeout,

@@ -1,3 +1,5 @@
+// Implementation of Socket (socket.hh).
+
 #include <fcntl.h>
 
 #include "socket.hh"
@@ -5,6 +7,8 @@
 
 using namespace std;
 
+// protocol 0 = the default protocol for the type (UDP for SOCK_DGRAM, TCP
+// for SOCK_STREAM)
 Socket::Socket(const int domain, const int type)
   : FileDescriptor(check_syscall(socket(domain, type, 0)))
 {}
@@ -27,6 +31,7 @@ Socket::Socket(FileDescriptor && fd, const int domain, const int type)
   }
 }
 
+// returns the option's actual length as reported by the kernel
 template<typename OptionType>
 socklen_t Socket::getsockopt(const int level, const int option_name,
                              OptionType & option_value) const
@@ -55,6 +60,9 @@ void Socket::connect(const Address & peer_addr)
   check_syscall(::connect(fd_num(), &peer_addr.sock_addr(), peer_addr.size()));
 }
 
+// getsockname()/getpeername() fill in a sockaddr; 'size' is in/out (buffer
+// size in, actual address length out). A plain sockaddr is big enough for
+// the IPv4 addresses this code uses.
 Address Socket::local_address() const
 {
   sockaddr addr;

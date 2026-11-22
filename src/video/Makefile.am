@@ -1,3 +1,6 @@
+# libvideo.a: raw-frame helpers (RawImage, SDL display, Y4M reader, V4L2
+# camera). The apps use image (RawImage) and sdl (VideoDisplay); v4l2 is used
+# only by the webcam tool below, and yuv4mpeg/video_input are unused.
 AM_CPPFLAGS = $(CXX17_FLAGS) -I$(srcdir)/../util $(VPX_CFLAGS) $(SDL_CFLAGS)
 AM_CXXFLAGS = $(PICKY_CXXFLAGS)
 

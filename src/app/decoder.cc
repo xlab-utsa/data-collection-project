@@ -1,3 +1,12 @@
+// Implementation of Frame and Decoder (decoder.hh): reassembly of Datagrams
+// into frames on the receiver, in-order delivery with skip-ahead recovery,
+// goodput measurement, and the worker thread that decodes (libvpx VP9),
+// records to .y4m and displays.
+//
+// Threads: the main thread (video_receiver.cc) calls add_datagram(),
+// next_frame_complete() and consume_next_frame(); complete frames are moved
+// into shared_queue_ under mtx_, and worker_main() takes them from there.
+
 #include <sys/sysinfo.h>
 
 #include <algorithm>
@@ -184,7 +193,10 @@ bool Decoder::next_frame_complete()
     }
   }
 
-  // seek forward if a key frame in the future is already complete
+  // Seek forward if a key frame in the future is already complete. A key
+  // frame does not depend on earlier frames, so everything before it can be
+  // abandoned. Scanning from the newest frame (rbegin) jumps to the most
+  // recent complete key frame, skipping as much stale video as possible.
   for (auto it = frame_buf_.rbegin(); it != frame_buf_.rend(); it++) {
     const auto frame_id = it->first;
     const auto & frame = it->second;

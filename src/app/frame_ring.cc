@@ -1,3 +1,11 @@
+// Implementation of FrameRing (frame_ring.hh): a fixed array of frame-sized
+// slots used as a circular queue between the capture thread (producer) and
+// the encoder thread (consumer).
+//
+// Indices: head_ is where the producer writes next, tail_ is where the
+// consumer reads next, count_ is how many committed frames sit in between.
+// Both advance modulo the number of slots, so slots are reused forever.
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -14,6 +22,8 @@ FrameRing::FrameRing(const size_t num_slots, const size_t frame_size)
   }
 }
 
+// e.g. 1080p I420 (~3 MB/frame) gets the full 500 slots, while 4K and 8K
+// frames get fewer so the ring stays within the memory budget.
 size_t FrameRing::capacity_for(const size_t frame_size,
                                const size_t memory_budget,
                                const size_t max_slots,

@@ -1,3 +1,7 @@
+# libutil.a: OS/network helpers shared by src/video and src/app
+# (file descriptors, sockets, event loops, timers, serialization).
+# epoller, tcp_socket and split are built but not used by the apps; mmap is
+# used only by the webcam tool (via src/video/v4l2.cc).
 AM_CPPFLAGS = $(CXX17_FLAGS)
 AM_CXXFLAGS = $(PICKY_CXXFLAGS)
 

@@ -1,3 +1,11 @@
+// Serialization of the wire messages declared in protocol.hh.
+//
+// Every field is written with put_number() (serialization.hh), which encodes
+// integers big-endian ("network byte order"), and read back with WireParser
+// in the same order. If you add a field, update the constructor,
+// serialized_size(), serialize_to_string() and the matching branch of
+// Msg::parse_from_string() together, on both ends.
+
 #include <stdexcept>
 #include "protocol.hh"
 #include "serialization.hh"
@@ -26,6 +34,8 @@ void Datagram::set_mtu(const size_t mtu)
   max_payload = mtu - 28 - Datagram::HEADER_SIZE;
 }
 
+// Layout: frame_id(4) frame_type(1) frag_id(2) frag_cnt(2) send_ts(8)
+//         payload(rest of the packet)
 bool Datagram::parse_from_string(const string & binary)
 {
   if (binary.size() < HEADER_SIZE) {
@@ -58,6 +68,8 @@ string Datagram::serialize_to_string() const
   return binary;
 }
 
+// Base message: just the one-byte type tag. Derived messages append their
+// fields after it.
 size_t Msg::serialized_size() const
 {
   return sizeof(type);
@@ -83,6 +95,8 @@ shared_ptr<Msg> Msg::parse_from_string(const string & binary)
   }
 }
 
+// Read the type tag, then the fields of that message type in the order
+// serialize_to_string() wrote them. Unknown types yield nullptr.
 shared_ptr<Msg> Msg::parse_body(const string & binary)
 {
   WireParser parser(binary);
@@ -126,6 +140,8 @@ size_t AckMsg::serialized_size() const
          + sizeof(uint64_t) + sizeof(uint8_t) + sizeof(uint32_t);
 }
 
+// Layout: type(1) frame_id(4) frag_id(2) send_ts(8)
+//         has_bitrate_feedback(1) measured_kbps_x100(4)
 string AckMsg::serialize_to_string() const
 {
   string binary;
@@ -152,6 +168,7 @@ size_t ConfigMsg::serialized_size() const
   return Msg::serialized_size() + 3 * sizeof(uint16_t) + sizeof(uint32_t);
 }
 
+// Layout: type(1) width(2) height(2) frame_rate(2) target_bitrate(4)
 string ConfigMsg::serialize_to_string() const
 {
   string binary;

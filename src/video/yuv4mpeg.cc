@@ -1,3 +1,6 @@
+// Implementation of YUV4MPEG (yuv4mpeg.hh). The file is read with the
+// blocking FileDescriptor helpers getline() and readn().
+
 #include <iostream>
 #include <vector>
 
@@ -22,6 +25,8 @@ YUV4MPEG::YUV4MPEG(const string & video_file_path,
     throw runtime_error("invalid YUV4MPEG2 file signature");
   }
 
+  // the rest of the header line: space-separated tokens, each a one-letter
+  // tag followed by its value (e.g. "W1280")
   const string & header = fd_.getline();
   const vector<string> & tokens = split(header, " ");
 
@@ -44,12 +49,14 @@ YUV4MPEG::YUV4MPEG(const string & video_file_path,
         break;
 
       case 'C': // color space
+        // prefix match, so variants like C420jpeg and C420mpeg2 are accepted
         if (token.substr(0, 4) != "C420") {
           throw runtime_error("only YUV420 color space is supported");
         }
         break;
 
       default:
+        // other tags (frame rate, interlacing, aspect ratio, ...) are ignored
         break;
     }
   }
@@ -64,6 +71,7 @@ bool YUV4MPEG::read_frame(RawImage & raw_img)
 
   string frame_header = fd_.getline();
 
+  // an empty line at EOF means we are past the last frame
   if (fd_.eof() and frame_header.empty()) {
     if (loop_) {
       // reset the file offset to the beginning and skip the header line
@@ -78,11 +86,13 @@ bool YUV4MPEG::read_frame(RawImage & raw_img)
     }
   }
 
+  // "FRAME" may be followed by per-frame parameters, which are ignored
   if (frame_header.substr(0, 5) != "FRAME") {
     throw runtime_error("invalid YUV4MPEG2 input format");
   }
 
   // read Y, U, V planes in order
+  // (readn() throws on a truncated last frame)
   raw_img.copy_y_from(fd_.readn(y_size()));
   raw_img.copy_u_from(fd_.readn(uv_size()));
   raw_img.copy_v_from(fd_.readn(uv_size()));

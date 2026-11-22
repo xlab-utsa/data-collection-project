@@ -1,3 +1,13 @@
+// Implementation of the sender's capture thread (capture.hh).
+//
+// V4L2 streaming in mmap mode, in short: ask the driver for a format
+// (VIDIOC_S_FMT, VIDIOC_S_PARM), request a few kernel buffers
+// (VIDIOC_REQBUFS), map each one into our address space (mmap) and hand them
+// to the driver (VIDIOC_QBUF), start streaming (VIDIOC_STREAMON). Then loop:
+// wait until a buffer is filled (poll), take it (VIDIOC_DQBUF), use the
+// pixels, and give it back (VIDIOC_QBUF). The driver cycles through the
+// buffers, so a buffer must be returned quickly or the camera stalls.
+
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/ioctl.h>

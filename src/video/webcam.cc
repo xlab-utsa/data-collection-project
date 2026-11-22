@@ -1,3 +1,14 @@
+// webcam: a small standalone viewer that shows a V4L2 camera in an SDL
+// window. Handy for checking that a camera works and supports a given
+// resolution in YUYV before running video_sender.
+//
+//   ./webcam [-d /dev/video0] 1280 720
+//
+// It is also the smallest complete example of the building blocks in
+// src/util and src/video working together: VideoDevice (camera) -> RawImage
+// (I420 frame) -> VideoDisplay (window), driven by a Poller event loop.
+// Not used by the sender/receiver apps.
+
 #include <getopt.h>
 #include <iostream>
 #include <string>
@@ -44,6 +55,7 @@ int main(int argc, char * argv[])
     }
   }
 
+  // exactly two positional arguments must remain: width and height
   if (optind != argc - 2) {
     print_usage(argv[0]);
     return EXIT_FAILURE;
@@ -53,6 +65,7 @@ int main(int argc, char * argv[])
   const uint16_t height = narrow_cast<uint16_t>(strict_stoi(argv[optind + 1]));
 
   // create a video device and set it to non-blocking
+  // (so read_frame() returns false instead of sleeping inside the callback)
   VideoDevice cam(video_device_path, width, height);
   cam.set_blocking(false);
 
@@ -63,6 +76,7 @@ int main(int argc, char * argv[])
   RawImage raw_img(width, height);
 
   // poll video frames from camera
+  // (the camera fd becomes readable when a filled buffer can be dequeued)
   Poller poller;
 
   poller.register_event(cam.fd(), Poller::In,
@@ -77,6 +91,8 @@ int main(int argc, char * argv[])
     }
   );
 
+  // poll(-1) waits for the next camera frame; signal_quit() is checked in
+  // between, so closing the window takes effect after the next frame arrives
   while (not display.signal_quit()) {
     poller.poll(-1);
   }

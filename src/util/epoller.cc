@@ -1,3 +1,6 @@
+// Implementation of Epoller (epoller.hh). Unused by the apps; see the header
+// for how it differs from Poller.
+
 #include <cstdio>
 #include <iostream>
 
@@ -6,6 +9,7 @@
 
 using namespace std;
 
+// EPOLL_CLOEXEC: do not leak the epoll fd into child processes (exec)
 Epoller::Epoller()
   : epfd_(check_syscall(epoll_create1(EPOLL_CLOEXEC)))
 {}
@@ -45,6 +49,8 @@ void Epoller::register_event(const FileDescriptor & fd,
   register_event(fd.fd_num(), flag, callback);
 }
 
+// unlike Poller, every change must be pushed to the kernel with epoll_ctl(),
+// so activate/deactivate only make the syscall when the bitmask changes
 void Epoller::activate(const int fd, const Flag flag)
 {
   uint32_t & active_events = active_events_.at(fd);
@@ -77,6 +83,9 @@ void Epoller::deactivate(const FileDescriptor & fd, const Flag flag)
   deactivate(fd.fd_num(), flag);
 }
 
+// Deregistration is deferred because a callback may ask to deregister an fd
+// while poll() is iterating over roster_; erasing right away would invalidate
+// that iteration.
 void Epoller::deregister(const int fd)
 {
   fds_to_deregister_.emplace(fd);
@@ -92,6 +101,7 @@ void Epoller::do_deregister()
   for (const int fd : fds_to_deregister_) {
     roster_.erase(fd);
     active_events_.erase(fd);
+    // throws (EBADF) if the fd was already closed: deregister before closing
     check_syscall(epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr));
   }
 
@@ -100,12 +110,18 @@ void Epoller::do_deregister()
 
 void Epoller::poll(const int timeout_ms)
 {
+  // at most this many ready fds are handled per call; any others stay ready
+  // (level-triggered) and are returned by the next call.
+  // Note: 'static' means the buffer is shared by all Epollers, so poll() must
+  // not be called from two threads at once.
   static constexpr size_t MAX_EVENTS = 32;
   static epoll_event event_list[MAX_EVENTS];
 
   // first, deregister the fds that have been scheduled to deregister
   do_deregister();
 
+  // returns the number of ready fds (0 on timeout). Unlike Poller::poll(),
+  // EINTR (interrupted by a signal) is not special-cased and will throw.
   int nfds = check_syscall(
     epoll_wait(epfd_, event_list, MAX_EVENTS, timeout_ms));
 
@@ -113,6 +129,8 @@ void Epoller::poll(const int timeout_ms)
     int fd = event_list[i].data.fd;
     uint32_t revents = event_list[i].events;
 
+    // run the callback of every registered flag the kernel reported
+    // (EPOLLERR/EPOLLHUP are not dispatched to any callback)
     for (const auto & [flag, callback] : roster_.at(fd)) {
       if (revents & flag) {
         callback(); // execute the callback function
@@ -123,6 +141,7 @@ void Epoller::poll(const int timeout_ms)
 
 void Epoller::epoll_add(const int fd, const uint32_t events)
 {
+  // data.fd is handed back to us by epoll_wait() to identify the ready fd
   epoll_event ev;
   ev.data.fd = fd;
   ev.events = events;

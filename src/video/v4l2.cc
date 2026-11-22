@@ -1,3 +1,6 @@
+// Implementation of VideoDevice (v4l2.hh). The step numbers in the comments
+// refer to the V4L2 streaming flow described in v4l2.hh.
+
 #include <sys/ioctl.h>
 #include <cassert>
 #include <cstring>
@@ -15,7 +18,7 @@ VideoDevice::VideoDevice(const string & video_device_path,
     display_width_(display_width),
     display_height_(display_height)
 {
-  // query the device about its capability
+  // query the device about its capability (step 1)
   v4l2_capability cap {};
   check_syscall(ioctl(fd_.fd_num(), VIDIOC_QUERYCAP, &cap));
 
@@ -27,7 +30,7 @@ VideoDevice::VideoDevice(const string & video_device_path,
     throw runtime_error("this device does not support streaming");
   }
 
-  // set pixel format and resolution
+  // set pixel format and resolution (step 2)
   v4l2_format fmt {};
   fmt.type = buffer_type;
   fmt.fmt.pix.pixelformat = pixel_format;
@@ -35,6 +38,8 @@ VideoDevice::VideoDevice(const string & video_device_path,
   fmt.fmt.pix.height = display_height;
   check_syscall(ioctl(fd_.fd_num(), VIDIOC_S_FMT, &fmt));
 
+  // S_FMT does not fail when the request is unsupported; the driver instead
+  // writes back the closest format it can do, so compare with what we asked
   if (fmt.fmt.pix.pixelformat != pixel_format) {
     throw runtime_error("cannot set pixel format to be YUYV");
   }
@@ -44,18 +49,22 @@ VideoDevice::VideoDevice(const string & video_device_path,
     throw runtime_error("cannot set video resolution as specified");
   }
 
-  // inform the device about the buffers about to be allocated
+  // inform the device about the buffers about to be allocated (step 3)
+  // (MMAP: the buffers live in kernel memory and we map them, rather than
+  // passing in our own memory)
   v4l2_requestbuffers buf_req {};
   buf_req.type = buffer_type;
   buf_req.memory = V4L2_MEMORY_MMAP;
   buf_req.count = NUM_BUFFERS;
   check_syscall(ioctl(fd_.fd_num(), VIDIOC_REQBUFS, &buf_req));
 
+  // the driver may grant a different number of buffers than requested
   if (buf_req.count != NUM_BUFFERS) {
     cerr << "Warning: requested " << NUM_BUFFERS << " V4L2 buffers but only "
          << buf_req.count << " were approved" << endl;
   }
 
+  // step 4, for every granted buffer
   buf_mem_.reserve(buf_req.count);
   for (size_t i = 0; i < buf_req.count; i++) {
     memset(&buf_info_, 0, sizeof(buf_info_));
@@ -64,9 +73,11 @@ VideoDevice::VideoDevice(const string & video_device_path,
     buf_info_.memory = V4L2_MEMORY_MMAP;
 
     // allocate buffer
+    // (QUERYBUF fills in the buffer's length and its offset for mmap)
     check_syscall(ioctl(fd_.fd_num(), VIDIOC_QUERYBUF, &buf_info_));
 
     // mmap buffer
+    // (buf_mem_[i] corresponds to V4L2 buffer index i)
     buf_mem_.emplace_back(
       buf_info_.length, PROT_READ | PROT_WRITE, MAP_SHARED,
       fd_.fd_num(), buf_info_.m.offset);
@@ -75,12 +86,13 @@ VideoDevice::VideoDevice(const string & video_device_path,
     check_syscall(ioctl(fd_.fd_num(), VIDIOC_QBUF, &buf_info_));
   }
 
-  // activate streaming
+  // activate streaming (step 5)
   check_syscall(ioctl(fd_.fd_num(), VIDIOC_STREAMON, &buffer_type));
 }
 
 VideoDevice::~VideoDevice()
 {
+  // don't throw from destructor
   if (ioctl(fd_.fd_num(), VIDIOC_STREAMOFF, &buffer_type) < 0) {
     cerr << "VideoDevice: unable to deactivate streaming" << endl;
   }
@@ -102,7 +114,8 @@ bool VideoDevice::read_frame(RawImage & raw_img)
   buf_info_.type = buffer_type;
   buf_info_.memory = V4L2_MEMORY_MMAP;
 
-  // try to dequeue a frame
+  // try to dequeue a frame (step 6)
+  // (on success, buf_info_.index says which buffer holds the new frame)
   if (ioctl(fd_.fd_num(), VIDIOC_DQBUF, &buf_info_) < 0) {
     return false;
   }
@@ -111,12 +124,14 @@ bool VideoDevice::read_frame(RawImage & raw_img)
   const MMap & frame_buf = buf_mem_.at(buf_info_.index);
 
   // frame_buf.size() is actually greater than the expected YUYV size
+  // (only the first 2 * W * H bytes are used, which assumes the driver packs
+  // rows with no padding, i.e. bytesperline == 2 * W)
   raw_img.copy_from_yuyv({
     reinterpret_cast<const char *>(frame_buf.addr()),
     static_cast<size_t>(display_width_ * display_height_ * 2)
   });
 
-  // enqueue the buffer back
+  // enqueue the buffer back (step 7)
   check_syscall(ioctl(fd_.fd_num(), VIDIOC_QBUF, &buf_info_));
 
   return true;

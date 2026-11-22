@@ -1,3 +1,5 @@
+// Implementation of split() (split.hh).
+
 #include <stdexcept>
 #include "split.hh"
 
@@ -11,6 +13,7 @@ vector<string> split(const string & str, const string & separator)
 
   vector<string> ret;
 
+  // repeatedly find the next separator and cut out the text before it
   size_t curr_pos = 0;
   while (curr_pos < str.size()) {
     size_t next_pos = str.find(separator, curr_pos);
